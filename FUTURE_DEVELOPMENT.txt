@@ -1,0 +1,94 @@
+APRFree: future developments and implementations
+================================================
+
+Last updated: October 5, 2026
+
+
+1. FINISH AND VERIFY WHAT EXISTS
+--------------------------------
+- Run on a physical iPhone. Set the signing team on both targets and confirm the app group works.
+- Check the lock-screen widgets (rectangular and circular). Only small and medium have been seen running.
+- Confirm reminders fire: due date the day before at 9:00, payday at 9:00.
+- Exercise CSV export, PDF summary, Back Up Now and Restore end to end.
+- View the onboarding strategy step with four options, and the new card and breakdown screens in dark mode.
+- Add an app icon.
+- Bank names are now text in typefaces that ship with iOS, not logos. Decide how far to keep that
+  styling for the App Store (see preparation.txt, section 2).
+- Put the project under version control.
+
+
+2. OPEN DECISIONS
+-----------------
+- Highest Balance currently ranks by monthly interest in dollars (balance x APR / 12). Decide whether
+  it should instead rank by raw balance, which is what the name suggests.
+- Pay-later installments have no 9-day lock, so paying the next one early advances the plan. Decide
+  whether they should follow the same lock as cards and loans.
+- Due dates pushed too far by the old logic are not rolled back automatically. Either add a one-time
+  repair or leave it to the "Next due date" field in the edit form.
+- The design canvas still shows the original Progress, Simulator, card and widget layouts. Update it
+  or retire it.
+- More open decisions found in the October 5 review are listed in checkup_oct5.txt, section 5: the
+  debt-free month, bonus money in Make a Payment, and minimums marked paid inside the 9-day lock.
+
+
+3. FEATURES LEFT OUT OF VERSION 1 ON PURPOSE
+--------------------------------------------
+- Face ID lock.
+- iCloud sync between devices.
+- Card design customization.
+- Statement check-in: a monthly prompt to enter the statement balance, so interest is captured.
+- Links that open each bank's app from a split line.
+- Balance transfer calculator.
+
+
+4. MAKE THE MONEY MATH RICHER
+-----------------------------
+- Card interest. Balances only change when the user edits them or adds a charge. Options: statement
+  check-in (above), or an optional estimate that accrues interest between check-ins.
+- Minimum payments that follow the balance (for example 1% plus interest, with a floor) instead of
+  one fixed number.
+- Promo-aware strategy: pay a 0% card off just before its promo ends instead of right after.
+- Variable APRs and a rate-change history.
+- Late fees and annual fees as their own entry types.
+- More than one income or payday schedule.
+- A fifth strategy that minimizes the number of open accounts, and a "what should I do with $X today"
+  quick answer outside of payday.
+- Speed up the simulation. It walks day by day through the calendar; a closed form between paydays
+  would make comparing thousands of orderings instant on the device.
+
+
+5. HISTORY AND UNDO
+-------------------
+- Undo for deleting a debt.
+- Redo, and a single "undo last action" shortcut.
+- Edit an entry's amount or date instead of undoing and re-entering it.
+- After an undo, only today's point on the Progress chart changes. Rebuild past points from the
+  records so the chart matches.
+- Filter and search the activity screen by debt, type and date.
+
+
+6. INSIGHT AND REPORTING
+------------------------
+- Month-over-month and year-in-review summaries.
+- Credit utilization over time, and the date each card drops under 30%.
+- A richer PDF report with the charts.
+- Export the plan itself (every future payday and where the money goes) to CSV or Calendar.
+
+
+7. FORECASTING AND MACHINE LEARNING (IDEAS, NOT STARTED)
+--------------------------------------------------------
+The app has no machine learning today. If it grows in that direction:
+- Forecast card spending from logged charges, so the plan accounts for new purchases.
+- Flag unusual charges or a balance that moved more than the recorded activity explains.
+- Suggest a safety buffer from the user's own payment history.
+All of it would have to run on the device to keep the "everything stays on your iPhone" promise.
+
+
+8. QUALITY AND REACH
+--------------------
+- UI tests and snapshot tests for each screen in light and dark mode.
+- iPad and landscape layouts.
+- Localization, and currencies other than US dollars.
+- Include the independent Python check model in the repository so the test figures can be reproduced.
+- Continuous integration that builds and runs the tests.
+- App Store preparation: see preparation.txt.

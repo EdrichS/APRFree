@@ -1,0 +1,233 @@
+APRFree: checkup, October 5, 2026
+=================================
+
+What was checked, what was found, what was fixed, what was left alone, and what to do next.
+Some of this repeats preparation.txt.
+
+
+1. RESULT IN SHORT
+------------------
+- 51 automated tests pass (47 before today, 4 added). They also pass under the address,
+  undefined-behaviour and thread sanitizers.
+- The static analyzer reports nothing. Debug and Release builds have no warnings.
+- No memory leaks found in two passes over the running app.
+- 31 problems found and fixed, from gaps in how data is saved down to a line of text that wrapped.
+  The most important three: a saved file could be overwritten if it ever failed to load; due dates
+  and paydays could shift by a day after a time-zone change; a credit card saved without a minimum
+  payment became permanently "overdue".
+- One of the fixes corrected a mistake of mine from earlier today (see 3.4, first item).
+- Nothing has been run on a real iPhone. Section 6 lists everything that was not verified.
+
+
+2. HOW IT WAS CHECKED
+---------------------
+Automated
+- Full test suite on the iPhone 17 simulator (iOS 26.3): 51 of 51 pass.
+- The same suite with Address Sanitizer and Undefined Behavior Sanitizer on: 51 pass, no reports.
+- The same suite with Thread Sanitizer on: 51 pass, no reports.
+- Clean build with the Xcode static analyzer: no warnings, no errors.
+- Release build: succeeds with no warnings. Looked inside the built app: both privacy manifests
+  are present, the export-compliance key is set, app and widget carry the same version (1.0, 1).
+
+Memory
+- Apple's "leaks" tool against the running app after: setup, add a card, Simulator, Settings,
+  Reset Everything. Result: 0 leaks.
+- Again, with allocation logging on, after: Balances, a card's detail, its History, Make a Payment
+  through to the split, Strategy. Result: 0 leaks.
+- Opened and closed a card's detail four times and compared allocations after the first and the
+  fourth: 121,228 blocks (22,507 KB) and 121,474 blocks (22,543 KB). Flat, so nothing is piling up.
+- In the source: the app has one class (AppStore) and it stores no closures; there are no timers,
+  no notification observers and no long-running tasks. Those are the usual sources of leaks.
+
+Reading the code
+- Read in full: the payoff engine, the payday and calendar code, the debt model, the store,
+  saving and loading, export, reminders, the widget, the add and edit forms, the payment sheet,
+  setup, Settings.
+- Scanned every source file for: force unwraps, try!, fatalError (none of any); division by a
+  value that could be zero (every one is guarded); network, tracking or location code (none).
+- Not read line by line: the Home, Balances and celebration screens, the card and pass drawings,
+  and parts of the detail, Progress and tool screens. Those were covered by the scans, the builds
+  and by looking at them running.
+
+On screen (simulator)
+- First-run setup from start to finish twice: once with a card and an income, once with a card at
+  29.99% APR and no income. Welcome, debts, payday, safety buffer, strategy, reminders, then Home.
+- The first three setup steps in dark mode.
+- Home, Progress, Simulator, a card's detail, its History, Balances, the payday split, Strategy and
+  Settings on the demo data. Progress and Simulator charts in light and dark.
+- Settings, Reset Everything, confirm: returns to the first setup step.
+- Your own saved data (9 debts, 63 entries, $24,839.75) opened on the final build, unchanged.
+
+
+3. WHAT WAS FOUND AND FIXED
+---------------------------
+
+3.1 Paydays (your request: check the predicted paydays, the 31st, a Friday, and so on)
+- A payday that had passed restarted the count from "today", which changed the weekday. Paid every
+  other Friday and opened on a Monday, the next payday became a Monday. Now the rhythm continues
+  from the payday you gave: still a Friday.
+- Monthly on the 31st drifted. After February the app paid on the 28th forever. It now remembers
+  the day you are paid on: Jan 31, Feb 28 (Feb 29 in a leap year), Mar 31, Apr 30, May 31.
+  The 29th and 30th work the same way.
+- Weekly and every-two-weeks keep their weekday across month ends, year ends and both clock
+  changes (tested 60 paydays ahead).
+- "Twice a month" is removed; three options remain. Data saved with the old option still loads,
+  as every two weeks.
+- If the app stayed in memory overnight, it kept yesterday's plan. It now recalculates when it
+  comes back to the front on a new day.
+- Setup and Settings both show the next three paydays so the rhythm can be seen before saving.
+
+3.2 No income entered (your request: the graph leaving its container)
+- Cause: with no money going in, the plan never ended, so the projected balance kept growing and
+  the line ran out of the top of the chart. The simulation also ran far longer than it needed to.
+- Now: with nothing to pay with there is no plan line at all. Progress and the Simulator say "no
+  payoff plan yet" and point to Settings. A plan whose payments never keep up with the interest
+  stops being simulated after 26 paydays without progress. Charts are clipped to their tiles.
+- Checked on screen with a 29.99% card and no income, on both Progress and the Simulator.
+
+3.3 Protecting saved data
+- If the saved file ever failed to load (a damaged file, or a future version changing the format),
+  the app started empty and the next change saved over the real data. Now a file that cannot be
+  understood is set aside as data-unreadable.json and never overwritten.
+- iOS can start an app before the iPhone is unlocked, when the file cannot be read yet. The app
+  would have shown setup and could then have saved over the data. Now it waits, loads the file when
+  the app comes to the front, and saves nothing until it has.
+- Numbers read from a backup are kept inside sane ranges, so a damaged or hand-edited backup
+  cannot stall the app (tested with 2,000,000,000 installments and negative balances).
+- Money and percent fields no longer accept negative or absurdly large values (possible before by
+  pasting or with a hardware keyboard).
+
+3.4 Dates
+- My mistake, now corrected: the chart clipping I added earlier today for 3.2 also cut off the
+  "Today" label and half of the last payoff dot on the Progress chart. The clip now covers the
+  whole chart area instead of only the plot.
+- Time zones. Dates were stored as "midnight where you were". After moving west, a due date read
+  as the day before, and a minimum already met could show as due again. Saved files and backups
+  now record their time zone and dates are moved to the new zone on loading, so Oct 9 stays Oct 9.
+  The widget shows dates in the zone the app wrote them in.
+- CSV export and the backup file name wrote dates in GMT, which is the day before for anyone east
+  of GMT. They now use the local day.
+- Chart labels on a short plan repeated the month ("Oct 26, Oct 26, Oct 26"), and "Oct 26" could
+  be read as a day. Short charts now label days ("Oct 12"); long ones label "Oct '26".
+- A date label at the very edge of a chart was cut off. That one label is now left out.
+
+3.5 Due dates and forms
+- A credit card saved with no minimum payment could never have its due date met, so it stayed
+  overdue forever and reminders said "$0.00 minimum". The form now asks for a minimum when the
+  card has a balance.
+- A paid-off card or loan could not be edited at all: saving required a balance above zero. It
+  can be edited now.
+- A greyed-out Add or Save button gave no reason. A line above it now says what is missing.
+- Editing a pay-later plan's other details reset money already paid toward the next installment.
+  The balance is now kept unless the total or the payment counts change.
+- New debts were stamped with the real clock instead of the app's clock.
+
+3.6 Reminders and the widget
+- Reminders and widget numbers were only refreshed when data changed. They are now refreshed
+  every time the app opens and when the day changes.
+- The reminder for the due date after next showed what was left of the current one (for example
+  $10.00 after a part payment) instead of the full minimum.
+- With many debts, the nearest reminders could be the ones dropped at iOS's limit of 64. The
+  soonest are now scheduled first.
+- The setup screen's example reminder always said "Chase is due tomorrow, due Oct 9". It now shows
+  your own first debt and its real amount and date.
+- Reset Everything also clears reminders already showing in Notification Center.
+
+3.7 Money figures and export
+- On a card's screen the sentence "Your plan saves $1,255.24" disagreed by a cent with the two
+  figures above it ($1,270.02 and $14.77). The sentence and the Total interest row are now worked
+  out from the figures as shown.
+- The PDF summary silently dropped debts that did not fit on one page. It now continues onto more.
+- A bank or card name beginning with =, +, - or @ would be run as a formula by a spreadsheet
+  opening the CSV. Those are exported as plain text.
+- The "extra each month" field read a comma decimal as thousands on iPhones set to regions that
+  use a comma: typing 12,50 gave $1,250.00.
+- Exported files waiting in the temporary folder are now protected while the iPhone is locked.
+
+3.8 Small things
+- Klarna's name was set too tightly. The credit card line in setup wrapped onto two lines.
+- On Progress with no plan, the line under "Not yet" was cut off mid-sentence, and a chart with a
+  single day of history was blank. The line is shorter now and the first day is marked with a dot.
+
+3.9 Added for the App Store (not bugs)
+- Privacy manifests for the app and the widget; the export-compliance key; a "not financial
+  advice, not affiliated" note in Settings; widget balances marked private for the Lock Screen;
+  and one switch (Wordmark.styled in Theme.swift) that turns all bank-name styling off.
+
+
+4. WHAT YOU ASKED FOR IN THIS ROUND, AND WHERE IT IS
+----------------------------------------------------
+- preparation.txt: written.
+- Bank names in typefaces instead of logos: done with fonts that ship with iOS. The banks' real
+  logo typefaces are proprietary and cannot be used; preparation.txt section 2 explains the risk
+  that remains.
+- Setup animations: APRFree/Screens/OnboardingMotion.swift, eight named slots with plain defaults.
+- Setup takes real input: debts can be added (as many as wanted) with all their values; Done
+  moves on and is only enabled once a debt exists; Skip is offered while there are none.
+- Income: Weekly, Every 2 weeks, Monthly. Payday logic checked and fixed (3.1).
+- Reset Everything: in Settings, with a confirmation.
+- The graph leaving its container: fixed (3.2).
+- This file.
+
+
+5. LEFT AS IT IS: BEHAVIOUR YOU SHOULD DECIDE ON
+------------------------------------------------
+None of these is a crash or a wrong sum. Each is a rule that could reasonably go either way.
+- "Highest Balance" ranks by monthly interest in dollars, not by raw balance.
+- Pay-later installments have no 9-day lock; cards and loans do.
+- The debt-free month is the month of the due date the last payment covers. Pay the last dollar on
+  Nov 5 toward a Dec 1 due date and the app says December.
+- Every full split in Make a Payment uses up the next payday. Splitting a bonus on the same day as
+  a paycheck moves the next payday on by one more period.
+- A minimum marked paid before its due date opens (inside the 9 days) is recorded as an extra
+  payment and the due date stays. The split line does say "pay from" the date it will count.
+- Card balances do not grow with interest on their own; they change when you edit them or add a
+  charge.
+- The monthly interest bars on a card's screen are each rounded to the cent, so they can add up to
+  a cent more or less than the total beside them.
+- After an undo, only today's point on the Progress chart changes; earlier points are not rebuilt.
+- A new card's preview in the add form reads "PAID OFF $0.00" until a balance is typed.
+
+
+6. NOT VERIFIED
+---------------
+- Anything on a real iPhone.
+- Reminders actually firing. The scheduling code was read and corrected, not observed.
+- The widget on screen after today's changes. Its numbers are tested; its drawing was only
+  compiled. The Lock Screen sizes have never been seen running.
+- CSV, PDF, Back Up Now and Restore through the share and file dialogs. Their contents are tested
+  (CSV rows, PDF page counts, backup round trip), the dialogs were not driven by hand.
+- The locked-iPhone start (3.3). It cannot be reproduced in the simulator; the logic was reviewed.
+- The time-zone move by actually changing the device's zone. It is covered by a test.
+- A comma-decimal region on screen.
+- The "what is missing" line for loans and pay-later plans (seen for cards only).
+- VoiceOver, large text sizes, small and large iPhones, and an iPad running the iPhone app.
+- The last change of the day (the dot and the shorter line on an empty Progress chart, 3.8) was
+  built and passed the tests but was not looked at on screen.
+- The leaks tool noted that it can inspect a simulator app only in a limited way. Instruments on a
+  real device is the fuller check.
+- Speed was not measured formally. One plan takes roughly 12 ms in the simulator (720 plans in
+  9 seconds in the test suite), so comparing four strategies is about a twentieth of a second.
+
+
+7. SUGGESTIONS, MOST IMPORTANT FIRST
+------------------------------------
+1.  Put the project in git now. Today's changes touched saving and loading; there is no history to
+    go back to if something turns out wrong.
+2.  Run it on your own iPhone for a full pay cycle before anything else. Most of section 6 clears
+    itself that way.
+3.  Add the monthly statement check-in before a public release, so card balances track reality.
+4.  Decide the items in section 5. Rename "Highest Balance" or change its rule; that one will
+    confuse people first.
+5.  Give Make a Payment a separate path for extra money that is not a paycheck.
+6.  Keep a copy of a real saved file from every released version and add a test that each still
+    loads. Saved data is the one thing an update must never break.
+7.  Store dates as calendar days (year, month, day) instead of moments in time. Today's fix makes
+    time zones safe; this would remove the whole class of problem.
+8.  Add UI tests for setup, adding a debt, Make a Payment and Reset. Those flows were checked by
+    hand today and will need checking again after every change.
+9.  Add Face ID lock. It is the feature people will look for in an app showing what they owe.
+10. For the App Store: icon, signing team, privacy policy page, and neutral demo data for the
+    screenshots. See preparation.txt.
+11. Put the independent Python check model in the repository so the expected figures in the tests
+    can be reproduced by someone else.

@@ -80,34 +80,37 @@ struct Debt: Identifiable, Codable, Hashable {
     // Credit card
     var creditLimit: Double?
     var promoAPR: Double?
-    var promoEnd: Date?
+    @AsOptionalDay var promoEnd: Date? = nil
 
     // Buy now, pay later
     var total: Double?
     var installments: Int?
     var paidInstallments: Int?
     var every: InstallmentEvery?
-    var nextDue: Date?
+    @AsOptionalDay var nextDue: Date? = nil
     var paidFrom: String?
     var autopay: Bool?
 
     // Loan
     var loanType: LoanType?
-    var endDate: Date?
+    @AsOptionalDay var endDate: Date? = nil
     var originalAmount: Double?
-    var startDate: Date?
+    @AsOptionalDay var startDate: Date? = nil
 
     // Bookkeeping
-    var addedAt: Date
+    /// The day the debt was added.
+    @AsDay var addedAt: Date
     /// Balance when the debt was added, plus later charges. Progress is measured against it.
     var startingBalance: Double
     /// Latest card or loan due date whose minimum was met.
-    var paidThrough: Date?
+    @AsOptionalDay var paidThrough: Date? = nil
     /// Paid so far toward the current due date. Cleared when the minimum is met.
     var paidTowardDue: Double?
     /// For loans: how much of that went to the cycle's interest.
     var interestTowardDue: Double?
-    var paidOffAt: Date?
+    @AsOptionalDay var paidOffAt: Date? = nil
+    /// The day of the latest statement check-in.
+    @AsOptionalDay var statementThrough: Date? = nil
 }
 
 extension Debt {
@@ -322,19 +325,21 @@ extension Debt {
 struct DebtState: Codable, Hashable {
     var balance: Double
     var startingBalance: Double
-    var paidThrough: Date?
+    @AsOptionalDay var paidThrough: Date? = nil
     var paidTowardDue: Double?
     var interestTowardDue: Double?
     var paidInstallments: Int?
-    var nextDue: Date?
-    var paidOffAt: Date?
+    @AsOptionalDay var nextDue: Date? = nil
+    @AsOptionalDay var paidOffAt: Date? = nil
+    @AsOptionalDay var statementThrough: Date? = nil
 }
 
 extension Debt {
     var state: DebtState {
         get {
             DebtState(balance: balance, startingBalance: startingBalance, paidThrough: paidThrough, paidTowardDue: paidTowardDue,
-                      interestTowardDue: interestTowardDue, paidInstallments: paidInstallments, nextDue: nextDue, paidOffAt: paidOffAt)
+                      interestTowardDue: interestTowardDue, paidInstallments: paidInstallments, nextDue: nextDue, paidOffAt: paidOffAt,
+                      statementThrough: statementThrough)
         }
         set {
             balance = newValue.balance
@@ -345,6 +350,7 @@ extension Debt {
             paidInstallments = newValue.paidInstallments
             nextDue = newValue.nextDue
             paidOffAt = newValue.paidOffAt
+            statementThrough = newValue.statementThrough
         }
     }
 
@@ -352,12 +358,12 @@ extension Debt {
     /// the amount comes off or goes back on, and a met due date steps back one cycle.
     mutating func reverse(_ record: PaymentRecord) {
         switch record.kind {
-        case .added:
+        case .added, .removed:
             return
         case .charge:
             balance = max(0, balance - record.amount).cents
             startingBalance = max(balance, startingBalance - record.amount).cents
-        case .adjustment:
+        case .adjustment, .statement:
             balance = max(0, balance - record.amount).cents
         case .minimum, .installment, .payment, .partial, .extra:
             balance = (balance + record.amount - (record.interest ?? 0)).cents
@@ -389,7 +395,7 @@ extension Debt {
         var r = record
         r.before = state
         switch record.kind {
-        case .added:
+        case .added, .removed:
             return record
         case .charge:
             if isPaidOff {
@@ -398,11 +404,13 @@ extension Debt {
             }
             balance = (balance + record.amount).cents
             startingBalance = (startingBalance + record.amount).cents
-        case .adjustment:
+        case .adjustment, .statement:
             let wasPaidOff = isPaidOff
             balance = max(0, balance + record.amount).cents
             if wasPaidOff && !isPaidOff { restartCycle(today: Cal.startOfDay(record.date)) }
             if kind == .card { startingBalance = max(startingBalance, balance) }
+            if record.kind == .statement { statementThrough = max(statementThrough ?? record.date, record.date) }
+            r.amount = (balance - (r.before?.balance ?? balance)).cents
         case .minimum, .installment, .payment, .partial, .extra:
             let result = pay(record.amount, on: Cal.startOfDay(record.date))
             guard result.amount > 0 else { return nil }
@@ -426,30 +434,51 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
         /// Money beyond what was due.
         case extra
         case charge
-        /// The balance was edited by hand, for example to match a statement. `amount` is signed.
+        /// The balance was edited by hand. `amount` is signed.
         case adjustment
+        /// A monthly statement check-in: the balance was set to what the statement says. `amount` is the
+        /// signed difference, which is the interest and anything else the app had not seen.
+        case statement
         /// The debt was added. `amount` is the balance it came in with.
         case added
+        /// The debt was deleted. `amount` is the balance it left with.
+        case removed
     }
 
     var id = UUID()
     var debtID: UUID
     var title: String
-    var date: Date
+    /// The day it happened.
+    @AsDay var date: Date
     var amount: Double
     var kind: Kind
-    /// For loan payments: the part that was interest.
+    /// For loan payments: the part that was interest. For a statement: the interest it reported, if entered.
     var interest: Double?
     /// The debt's balance right after this entry.
     var balanceAfter: Double?
     /// The debt as it stood just before this entry. Undo puts it back.
     var before: DebtState?
+    /// What kind of debt this was, kept so history still adds up after the debt is deleted.
+    var debtKind: DebtKind?
+    /// For a "deleted" entry: the debt as it was, so the deletion can be undone.
+    var removed: Debt?
 
     /// True for money paid toward the debt, as opposed to charges and bookkeeping entries.
     var isPayment: Bool {
         switch kind {
         case .minimum, .installment, .payment, .partial, .extra: true
-        case .charge, .adjustment, .added: false
+        case .charge, .adjustment, .statement, .added, .removed: false
+        }
+    }
+
+    /// Entries whose amount can go either way, so it is shown with its sign.
+    var isSigned: Bool { kind == .adjustment || kind == .statement }
+
+    /// Entries whose amount or date can be changed afterwards.
+    var isEditable: Bool {
+        switch kind {
+        case .minimum, .installment, .payment, .partial, .extra, .charge: true
+        case .adjustment, .statement, .added, .removed: false
         }
     }
 
@@ -463,7 +492,9 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
         case .extra: "Extra payment"
         case .charge: "Charge added"
         case .adjustment: "Balance updated"
+        case .statement: "Statement check-in"
         case .added: "Added"
+        case .removed: "Deleted"
         }
     }
 
@@ -476,7 +507,9 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
         case .extra: "\(title) extra payment"
         case .charge: "\(title) charge added"
         case .adjustment: "\(title) balance updated"
+        case .statement: "\(title) statement check-in"
         case .added: "\(title) added"
+        case .removed: "\(title) deleted"
         }
     }
 
@@ -484,8 +517,8 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
     var signedAmount: String {
         switch kind {
         case .charge: "+\(amount.usd)"
-        case .adjustment: amount >= 0 ? "+\(amount.usd)" : "−\((-amount).usd)"
-        case .added: amount.usd
+        case .adjustment, .statement: amount >= 0 ? "+\(amount.usd)" : "−\((-amount).usd)"
+        case .added, .removed: amount.usd
         default: "−\(amount.usd)"
         }
     }
@@ -493,7 +526,7 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
 
 /// The balances on one day. Card and loan totals are optional because older saved data only has the total.
 struct BalancePoint: Codable, Hashable {
-    var date: Date
+    @AsDay var date: Date
     var total: Double
     var cards: Double?
     var loans: Double?

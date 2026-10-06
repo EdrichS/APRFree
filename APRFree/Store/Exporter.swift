@@ -30,76 +30,25 @@ enum Exporter {
         return rows.joined(separator: "\n") + "\n"
     }
 
+    /// Exports are written into a folder of their own in the temporary directory, so they can be
+    /// found again and removed.
+    private static var folder: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("APRFree exports", isDirectory: true)
+    }
+
+    /// Removes any export still waiting to be shared. Part of Reset Everything.
+    static func removeExports() {
+        try? FileManager.default.removeItem(at: folder)
+    }
+
     static func write(_ contents: Data, named name: String) -> URL? {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent(name)
         do {
             try contents.write(to: url, options: [.atomic, .completeFileProtection])
             return url
         } catch {
             return nil
-        }
-    }
-
-    /// A snapshot: totals, every debt, and the current plan. Runs onto more pages when the list is long.
-    static func pdf(data: AppData, plan: PlanResult, strategy: String, today: Date) -> Data {
-        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
-        let renderer = UIGraphicsPDFRenderer(bounds: page)
-        return renderer.pdfData { context in
-            context.beginPage()
-            var y: CGFloat = 54
-            func draw(_ text: String, size: CGFloat, weight: UIFont.Weight = .regular, color: UIColor = .black,
-                      x: CGFloat = 54, right: Bool = false) {
-                let attrs: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: size, weight: weight),
-                                                            .foregroundColor: color]
-                let string = NSAttributedString(string: text, attributes: attrs)
-                let origin = right ? CGPoint(x: page.width - 54 - string.size().width, y: y) : CGPoint(x: x, y: y)
-                string.draw(at: origin)
-            }
-            func rule() {
-                let path = UIBezierPath()
-                path.move(to: CGPoint(x: 54, y: y))
-                path.addLine(to: CGPoint(x: page.width - 54, y: y))
-                UIColor(white: 0.85, alpha: 1).setStroke()
-                path.stroke()
-            }
-
-            draw("APRFree summary", size: 24, weight: .bold)
-            draw(Fmt.full(today), size: 11, color: .darkGray, right: true)
-            y += 44
-            let total = data.debts.reduce(0) { $0 + $1.balance }
-            draw("Total balance", size: 11, color: .darkGray)
-            y += 16
-            draw(total.usd, size: 28, weight: .bold)
-            y += 44
-            draw("Strategy: \(strategy)", size: 12)
-            draw("Debt-free: \(plan.debtFree.map(Fmt.monthYear) ?? "Not on this plan")", size: 12, right: true)
-            y += 18
-            draw("Interest still to pay on this plan: \(plan.totalInterest.usd)", size: 12)
-            y += 30
-            rule()
-            y += 10
-            draw("Debt", size: 10, weight: .semibold, color: .darkGray)
-            draw("APR", size: 10, weight: .semibold, color: .darkGray, x: 300)
-            draw("Payment", size: 10, weight: .semibold, color: .darkGray, x: 380)
-            draw("Balance", size: 10, weight: .semibold, color: .darkGray, right: true)
-            y += 18
-            for d in data.debts where !d.isPaidOff {
-                if y > page.height - 110 {
-                    context.beginPage()
-                    y = 54
-                }
-                draw(d.title, size: 12, weight: .semibold)
-                draw(Fmt.percent(d.apr(on: today)), size: 12, x: 300)
-                draw(d.minimum.usd, size: 12, x: 380)
-                draw(d.balance.usd, size: 12, right: true)
-                y += 15
-                draw(d.detail, size: 10, color: .darkGray)
-                y += 19
-            }
-            y += 6
-            rule()
-            y += 12
-            draw("Made on this iPhone. Nothing was uploaded.", size: 10, color: .darkGray)
         }
     }
 }

@@ -1,7 +1,27 @@
 APRFree: future developments and implementations
 ================================================
 
-Last updated: October 5, 2026
+Last updated: October 6, 2026
+
+
+0. DONE SINCE THE LAST VERSION OF THIS FILE (OCTOBER 6)
+-------------------------------------------------------
+Moved out of the lists below because they are built:
+- Monthly statement check-in, on its own Statements page with a statement for every month.
+- Credit utilization over time, and the date each card drops under 30%.
+- More than one income, each with its own pay days, and a fixed monthly amount in their place.
+- "What should I do with $X today": the Extra Money tool, and a separate path in Make a Payment
+  for money that is not a paycheck.
+- Undo for deleting a debt, redo, and a single "undo last action" shortcut with a confirmation.
+- Editing an entry's amount or day.
+- Past points on the Progress chart are rebuilt from the entries after an undo or an edit.
+- A faster simulation that takes each stretch between paydays in one step.
+- A PDF report with charts.
+- Dates saved as calendar days instead of moments in time.
+- A one-time repair for due dates the old logic pushed too far.
+- The Highest Balance strategy was removed. Three remain.
+- A privacy policy and a disclaimer that have to be accepted during setup.
+- An eye button on the widget that hides the amounts.
 
 
 1. FINISH AND VERIFY WHAT EXISTS
@@ -9,69 +29,78 @@ Last updated: October 5, 2026
 - Run on a physical iPhone. Set the signing team on both targets and confirm the app group works.
 - Check the lock-screen widgets (rectangular and circular). Only small and medium have been seen running.
 - Confirm reminders fire: due date the day before at 9:00, payday at 9:00.
-- Exercise CSV export, PDF summary, Back Up Now and Restore end to end.
-- View the onboarding strategy step with four options, and the new card and breakdown screens in dark mode.
+- Exercise CSV export, the PDF report, Back Up Now and Restore end to end.
+- Go through every new screen from October 6 by hand: Statements and the check-in, Income with two
+  or three incomes, Extra Money, editing and undoing entries, Undo and Redo.
 - Add an app icon.
-- Bank names are now text in typefaces that ship with iOS, not logos. Decide how far to keep that
+- Work through oct6check.txt, sections 7 (not verified) and 8 (suggestions).
+- Have a lawyer read the privacy policy and the disclaimer (APRFree/Screens/LegalScreens.swift),
+  and host the privacy policy on a web page for the App Store.
+- Bank names are text in typefaces that ship with iOS, not logos. Decide how far to keep that
   styling for the App Store (see preparation.txt, section 2).
-- Put the project under version control.
+- The statement titles were asked for in Apple Chancery, which iOS does not have. They are in
+  Snell Roundhand. Pick a different iOS face if that is not close enough (README, "Statement
+  typeface").
 
 
 2. OPEN DECISIONS
 -----------------
-- Highest Balance currently ranks by monthly interest in dollars (balance x APR / 12). Decide whether
-  it should instead rank by raw balance, which is what the name suggests.
-- Pay-later installments have no 9-day lock, so paying the next one early advances the plan. Decide
-  whether they should follow the same lock as cards and loans.
-- Due dates pushed too far by the old logic are not rolled back automatically. Either add a one-time
-  repair or leave it to the "Next due date" field in the edit form.
-- The design canvas still shows the original Progress, Simulator, card and widget layouts. Update it
-  or retire it.
-- More open decisions found in the October 5 review are listed in checkup_oct5.txt, section 5: the
-  debt-free month, bonus money in Make a Payment, and minimums marked paid inside the 9-day lock.
+- The debt-free month is the month of the due date the final payment covers, which can be the
+  month after the last payment is actually made. Some people will expect the earlier month.
+- In a paycheck split, a minimum whose due date is still inside the 9-day wait is recorded as an
+  extra payment if it is marked paid early, and the due date stays. Decide whether marking it early
+  should be blocked, or allowed and counted.
+- The safety buffer is one amount held back from every paycheck, whichever income it is. With a
+  small second income that may be too much. Consider a buffer per income.
+- A fixed monthly amount is paid on one day of the month. Consider letting it be split across two.
+- Insights estimates a month's interest; the statement shows only what was recorded. The two differ
+  until check-ins are done every month (oct6check.txt, section 5). Make Insights use the recorded
+  figure once a month has check-ins.
+- The design canvas: see section 9.
+
+Settled on October 6:
+- Pay-later installments stay without the 9-day wait. Klarna's and Affirm's own rules were checked
+  and the app already matches them (communicator.txt, section 6).
 
 
-3. FEATURES LEFT OUT OF VERSION 1 ON PURPOSE
---------------------------------------------
+3. FEATURES LEFT OUT ON PURPOSE
+-------------------------------
 - Face ID lock.
 - iCloud sync between devices.
 - Card design customization.
-- Statement check-in: a monthly prompt to enter the statement balance, so interest is captured.
-- Links that open each bank's app from a split line.
 - Balance transfer calculator.
+- Anything that connects to a bank. The options, in order of what they cost, are in communicator.txt.
 
 
 4. MAKE THE MONEY MATH RICHER
 -----------------------------
-- Card interest. Balances only change when the user edits them or adds a charge. Options: statement
-  check-in (above), or an optional estimate that accrues interest between check-ins.
+- A monthly reminder for the statement check-in.
+- Refuse, with a clear message, data saved by a newer version of the app.
+- Card interest between check-ins: an optional estimate that accrues interest until the next
+  statement check-in replaces it with the real figure.
 - Minimum payments that follow the balance (for example 1% plus interest, with a floor) instead of
   one fixed number.
 - Promo-aware strategy: pay a 0% card off just before its promo ends instead of right after.
 - Variable APRs and a rate-change history.
 - Late fees and annual fees as their own entry types.
-- More than one income or payday schedule.
-- A fifth strategy that minimizes the number of open accounts, and a "what should I do with $X today"
-  quick answer outside of payday.
-- Speed up the simulation. It walks day by day through the calendar; a closed form between paydays
-  would make comparing thousands of orderings instant on the device.
+- A fourth strategy that minimizes the number of open accounts.
+- A "best order" finder. The plan now runs fast enough to try thousands of orders on the device,
+  so the app could search for the cheapest order under the user's own constraints.
+- Past credit limits. Utilization history is measured against today's limits.
 
 
 5. HISTORY AND UNDO
 -------------------
-- Undo for deleting a debt.
-- Redo, and a single "undo last action" shortcut.
-- Edit an entry's amount or date instead of undoing and re-entering it.
-- After an undo, only today's point on the Progress chart changes. Rebuild past points from the
-  records so the chart matches.
 - Filter and search the activity screen by debt, type and date.
+- Editing balance changes and statement check-ins. Today only payments and charges can be edited;
+  the others can be undone and entered again.
+- A longer undo history. The last 15 actions are kept.
 
 
 6. INSIGHT AND REPORTING
 ------------------------
 - Month-over-month and year-in-review summaries.
-- Credit utilization over time, and the date each card drops under 30%.
-- A richer PDF report with the charts.
+- A statement as a PDF of its own, one month at a time.
 - Export the plan itself (every future payday and where the money goes) to CSV or Calendar.
 
 
@@ -92,3 +121,42 @@ All of it would have to run on the device to keep the "everything stays on your 
 - Include the independent Python check model in the repository so the test figures can be reproduced.
 - Continuous integration that builds and runs the tests.
 - App Store preparation: see preparation.txt.
+
+
+9. THE DESIGN CANVAS: OUT OF DATE, NOT UPDATED
+----------------------------------------------
+The Design canvas "APRFree v1 Screens" (https://claude.ai/artifact/7ubT4xqHRyFaBG5VBuRCbM) was
+drawn before the app was built and has NOT been brought up to date. On October 6 it held 58 screen
+artboards (29 screens, light and dark) plus a Logo-Icon artboard added after the originals. Updating
+it means redrawing about two thirds of those by hand and adding eleven screens that do not exist
+in it, and merging with the newer version already published to it. That is a job of its own.
+
+Until it is done, treat the canvas as the original concept, not as a picture of the app. Either
+update it in a session of its own, or retire it.
+
+Artboards that no longer match the app:
+- Onboarding 1b First Debt: now three "add" rows, an Added list, Done and Skip.
+- Onboarding 1c Payday: three choices, and a line showing the next paydays.
+- Onboarding 1e Strategy: three strategies, not two.
+- Onboarding 1f Reminders: the example now uses the user's own debt.
+- Main: bank names set as text, six tools instead of four, three page dots, Undo and Redo in the menu.
+- Progress: switchable between Total, Credit cards and Loans; "Show All Activity".
+- Card Detail (Chase, Citi): "Total Cost of This Card" in place of "Where Your Payment Goes"; a History row.
+- Loan Detail: projected total interest in place of the small chart.
+- Strategy: three strategies and the comparison table.
+- Simulator: any custom amount; hold and drag to read the chart.
+- Settings: no Payday section; Income, About and Reset Everything.
+- Payment 7a Amount: the Paycheck / Extra money switch.
+- Add Debt 6a Providers and the card form: bank names as text tiles; the line that says what is missing.
+- Export: a PDF report rather than a one-page summary.
+- Widgets: the total / credit cards / loans choice and the eye button.
+
+Screens the app has that the canvas does not:
+- Setup: Privacy Policy, Disclaimer.
+- Statements (the stack of months), one Statement, the Statement Check-In sheet.
+- Income, and the editor for one income.
+- Extra Money ("Where It Goes").
+- Balances (the ring chart), Activity (all of it), a debt's History, Edit Entry.
+
+Still about right: Onboarding Welcome and Safety Buffer, Pick Card, the pay-later and loan forms,
+the Klarna detail, Celebration, Home Empty, Insights, Payment Split and Mark Paid, Components.

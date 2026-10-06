@@ -100,18 +100,23 @@ struct PaymentSheet: View {
         if let id = request.debtID {
             SinglePayment(debtID: id)
         } else {
-            PaydayPayment()
+            PaydayPayment(extra: request.extraMoney)
         }
     }
 }
 
 /// Make a Payment: the amount, the split, then marking each line paid.
+///
+/// It has two paths. A paycheck keeps the safety buffer, covers what is due before the next payday,
+/// and uses that payday up once every line is paid. Extra money (a bonus, a refund, a gift) keeps
+/// nothing back, goes to anything overdue and then straight down the strategy, and uses up no payday.
 private struct PaydayPayment: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
 
     private enum Step { case amount, split, mark }
     @State private var step = Step.amount
+    @State var extra: Bool
     @State private var entry = AmountEntry()
     @State private var split: Split?
     @State private var paid: Set<UUID> = []
@@ -144,21 +149,35 @@ private struct PaydayPayment: View {
                 }
             }
         }
-        .onAppear { entry = AmountEntry(store.suggestedPayment) }
+        .onAppear { entry = extra ? AmountEntry() : AmountEntry(store.suggestedPayment) }
         .onDisappear { commit() }
     }
 
     private var title: String {
         switch step {
-        case .amount: "Make a Payment"
-        case .split: "The Split"
+        case .amount: extra ? "Extra Money" : "Make a Payment"
+        case .split: extra ? "Where It Goes" : "The Split"
         case .mark: "Mark as Paid"
         }
     }
 
+    private var amountNote: String {
+        if extra { return "Not a paycheck: nothing is held back and no payday is used up" }
+        return store.upcomingPaydays(1).isEmpty ? "No payday set: covers the next two weeks" : "Payday \(Fmt.weekday(store.paydays.current))"
+    }
+
     private var amountStep: some View {
         VStack(spacing: 16) {
-            AmountPad(entry: $entry, caption: "Amount to pay", note: "Payday \(Fmt.weekday(store.paydays.current))") {
+            Picker("Kind of money", selection: Binding(get: { extra }, set: { on in
+                extra = on
+                entry = on ? AmountEntry() : AmountEntry(store.suggestedPayment)
+            })) {
+                Text("Paycheck").tag(false)
+                Text("Extra money").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(.top, 8)
+            AmountPad(entry: $entry, caption: extra ? "Extra money to put toward debt" : "Amount to pay", note: amountNote) {
                 Button("+ $150") { entry.add(150) }
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
@@ -167,8 +186,10 @@ private struct PaydayPayment: View {
                     .background(Theme.card, in: Capsule())
                     .buttonStyle(.plain)
             }
-            Button("See the Split") {
-                split = PayoffEngine.split(amount: entry.value, debts: store.data.debts, settings: store.settings, today: store.today)
+            Button(extra ? "See Where It Goes" : "See the Split") {
+                split = extra
+                    ? PayoffEngine.extraSplit(amount: entry.value, debts: store.data.debts, settings: store.settings, today: store.today)
+                    : PayoffEngine.split(amount: entry.value, debts: store.data.debts, settings: store.settings, today: store.today)
                 paid = []
                 step = .split
             }
@@ -177,14 +198,44 @@ private struct PaydayPayment: View {
         }
     }
 
+    private func headline(_ split: Split) -> String {
+        let hasPaydays = !store.upcomingPaydays(1).isEmpty
+        if split.isExtraMoney {
+            return hasPaydays ? "All of it goes to debt today. Your next payday stays \(Fmt.monthDay(split.nextPayday))." : "All of it goes to debt today."
+        }
+        return hasPaydays ? "Next payday \(Fmt.monthDay(split.nextPayday)) · \(split.bufferKept.usd) buffer kept"
+                          : "Covers what is due through \(Fmt.monthDay(split.nextPayday)) · \(split.bufferKept.usd) buffer kept"
+    }
+
+    /// What putting the extra money in today does to the plan: the interest it saves and how much
+    /// sooner everything is paid off. Nil when either plan never finishes.
+    private func effect(of split: Split) -> String? {
+        var debts = store.data.debts
+        for line in split.lines {
+            guard let i = debts.firstIndex(where: { $0.id == line.debtID }) else { continue }
+            debts[i].pay(line.amount, on: store.today)
+        }
+        let base = store.plan
+        let after = PayoffEngine.simulate(store.planInput(debts: debts))
+        guard base.finished, after.finished, let was = base.debtFree, let now = after.debtFree else { return nil }
+        let saved = (base.totalInterest - after.totalInterest).cents
+        let months = Cal.months(from: now, to: was)
+        var parts: [String] = []
+        if saved > 0.005 { parts.append("saves about \(saved.usd) in interest") }
+        if months > 0 { parts.append("finishes \(Fmt.plural(months, "month")) sooner") }
+        guard !parts.isEmpty else { return "Debt-free stays \(Fmt.monthYear(now))." }
+        let text = parts.joined(separator: " and ")
+        return "On your plan this " + text + "."
+    }
+
     @ViewBuilder private var splitStep: some View {
         if let split {
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
                         VStack(alignment: .leading, spacing: 4) {
-                            Text(Fmt.weekday(split.payday)).font(.title.weight(.bold))
-                            Text("Next payday \(Fmt.monthDay(split.nextPayday)) · \(split.bufferKept.usd) buffer kept")
+                            Text(split.isExtraMoney ? "\(split.amount.usd) extra" : Fmt.weekday(split.payday)).font(.title.weight(.bold))
+                            Text(headline(split))
                                 .font(.subheadline)
                                 .monospacedDigit()
                                 .foregroundStyle(Theme.secondary)
@@ -211,8 +262,16 @@ private struct PaydayPayment: View {
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(Theme.orange)
                             }
+                            if split.lines.isEmpty {
+                                Text(store.active.isEmpty ? "Nothing is owed, so there is nowhere for it to go."
+                                                          : "Nothing is left once the safety buffer is kept. Try a larger amount.")
+                                    .font(.headline)
+                            }
                             if let summary = split.summary {
                                 Text(summary).font(.headline).monospacedDigit()
+                            }
+                            if split.isExtraMoney, let effect = effect(of: split) {
+                                Text(effect).font(.subheadline).monospacedDigit()
                             }
                             Text("Pay in each bank’s app, then mark it paid here.")
                                 .font(.footnote)
@@ -284,8 +343,7 @@ private struct PaydayPayment: View {
     private func commit() {
         guard !committed, let split, !paid.isEmpty else { return }
         committed = true
-        store.apply(split.lines.filter { paid.contains($0.id) }, allPaid: paid.count == split.lines.count,
-                    nextPayday: split.nextPayday)
+        store.apply(split, paid: paid)
     }
 }
 

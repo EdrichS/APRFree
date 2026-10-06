@@ -28,12 +28,24 @@ struct BalanceWidgetIntent: WidgetConfigurationIntent {
     var show: WidgetScope
 }
 
+/// The eye button on the widget: hides the balances, or shows them again. It runs without opening the app.
+struct ToggleBalancesIntent: AppIntent {
+    static let title: LocalizedStringResource = "Hide or Show Balances"
+    static let description: IntentDescription? = IntentDescription("Hides the balances on the APRFree widgets, or shows them again.")
+
+    func perform() async throws -> some IntentResult {
+        WidgetSnapshot.balancesHidden.toggle()
+        // Every APRFree widget follows, not only the one that was tapped.
+        WidgetCenter.shared.reloadAllTimelines()
+        return .result()
+    }
+}
+
 struct SnapshotEntry: TimelineEntry {
     let date: Date
     let scope: DebtScope
     let numbers: ScopeSnapshot
-    /// The time zone the app wrote the dates in.
-    var zone = TimeZone.current
+    var hidden = false
 }
 
 struct SnapshotProvider: AppIntentTimelineProvider {
@@ -54,7 +66,7 @@ struct SnapshotProvider: AppIntentTimelineProvider {
     private func entry(for configuration: BalanceWidgetIntent, sample: Bool) -> SnapshotEntry {
         let scope = configuration.show.scope
         let snapshot = sample ? WidgetSnapshot.sample : WidgetSnapshot.load() ?? .empty
-        return SnapshotEntry(date: .now, scope: scope, numbers: snapshot.scope(scope), zone: snapshot.timeZone)
+        return SnapshotEntry(date: .now, scope: scope, numbers: snapshot.scope(scope), hidden: !sample && WidgetSnapshot.balancesHidden)
     }
 }
 
@@ -68,18 +80,24 @@ private enum WidgetStyle {
         ((value * 100).rounded() / 100).formatted(.currency(code: "USD").locale(Locale(identifier: "en_US")))
     }
 
-    private static func dates(in zone: TimeZone) -> Date.FormatStyle {
-        var style = Date.FormatStyle.dateTime
-        style.timeZone = zone
-        return style
+    /// What stands in for an amount while balances are hidden.
+    static let dots = "$ • • • •"
+
+    /// Dates arrive as calendar days, so they read the same wherever the iPhone is. A day is a
+    /// Gregorian year, month and day, so it is turned into a date with that calendar even when the
+    /// iPhone is set to another one.
+    private static let calendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = .current
+        return c
+    }()
+
+    static func monthDay(_ day: Day?) -> String {
+        day.map { $0.date(in: calendar).formatted(.dateTime.month(.abbreviated).day()) } ?? "None"
     }
 
-    static func monthDay(_ date: Date?, in zone: TimeZone) -> String {
-        date.map { $0.formatted(dates(in: zone).month(.abbreviated).day()) } ?? "None"
-    }
-
-    static func monthYear(_ date: Date?, in zone: TimeZone) -> String {
-        date.map { $0.formatted(dates(in: zone).month(.abbreviated).year()) } ?? "Not set"
+    static func monthYear(_ day: Day?) -> String {
+        day.map { $0.date(in: calendar).formatted(.dateTime.month(.abbreviated).year()) } ?? "Not set"
     }
 }
 
@@ -87,7 +105,7 @@ struct APRFreeWidgetView: View {
     @Environment(\.widgetFamily) private var family
     let scope: DebtScope
     let numbers: ScopeSnapshot
-    var zone = TimeZone.current
+    var hidden = false
 
     private var percent: Int { Int((numbers.fractionPaid * 100).rounded()) }
     private var fraction: Double { min(max(numbers.fractionPaid, 0), 1) }
@@ -101,31 +119,61 @@ struct APRFreeWidgetView: View {
         }
     }
 
+    /// An open eye while balances show; tapping it hides them and it becomes an eye with a slash.
+    private var eye: some View {
+        Button(intent: ToggleBalancesIntent()) {
+            Image(systemName: hidden ? "eye.slash" : "eye")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 28, height: 24, alignment: .trailing)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(hidden ? "Show balances" : "Hide balances")
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 4) {
+            Text("APRFree").font(.caption.weight(.bold))
+            Spacer(minLength: 0)
+            eye
+        }
+    }
+
+    private var balance: some View {
+        Text(hidden ? WidgetStyle.dots : WidgetStyle.money(numbers.balance))
+            .monospacedDigit()
+            .minimumScaleFactor(0.6)
+            .lineLimit(1)
+            .privacySensitive()
+            .accessibilityLabel(hidden ? "Balance hidden" : WidgetStyle.money(numbers.balance))
+    }
+
     private var change: some View {
         let down = numbers.changeThisMonth <= 0
         return VStack(alignment: .leading, spacing: 0) {
-            Label(WidgetStyle.money(abs(numbers.changeThisMonth)), systemImage: down ? "arrow.down" : "arrow.up")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(down ? WidgetStyle.green : Color.secondary)
-                .labelStyle(.titleAndIcon)
+            if hidden {
+                Text("Hidden").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+            } else {
+                Label(WidgetStyle.money(abs(numbers.changeThisMonth)), systemImage: down ? "arrow.down" : "arrow.up")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(down ? WidgetStyle.green : Color.secondary)
+                    .labelStyle(.titleAndIcon)
+            }
             Text("this month")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .privacySensitive()
     }
 
     private var small: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("APRFree").font(.caption.weight(.bold))
+            header
             Spacer(minLength: 0)
             Text(scope.balanceLabel).font(.caption).foregroundStyle(.secondary)
-            Text(WidgetStyle.money(numbers.balance))
-                .font(.title2.weight(.bold))
-                .monospacedDigit()
-                .minimumScaleFactor(0.6)
-                .lineLimit(1)
-                .privacySensitive()
-            change.padding(.top, 6).privacySensitive()
+            balance.font(.title2.weight(.bold))
+            change.padding(.top, 6)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
     }
@@ -141,20 +189,15 @@ struct APRFreeWidgetView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("APRFree").font(.caption.weight(.bold))
+                    header
                     Spacer(minLength: 0)
                     Text(scope.balanceLabel).font(.caption).foregroundStyle(.secondary)
-                    Text(WidgetStyle.money(numbers.balance))
-                        .font(.title.weight(.bold))
-                        .monospacedDigit()
-                        .minimumScaleFactor(0.6)
-                        .lineLimit(1)
-                        .privacySensitive()
+                    balance.font(.title.weight(.bold))
                 }
                 Spacer(minLength: 12)
                 VStack(alignment: .leading, spacing: 8) {
-                    pair("Next due", WidgetStyle.monthDay(numbers.nextDue, in: zone))
-                    pair(scope.freeLabel, WidgetStyle.monthYear(numbers.free, in: zone))
+                    pair("Next due", WidgetStyle.monthDay(numbers.nextDue))
+                    pair(scope.freeLabel, WidgetStyle.monthYear(numbers.free))
                 }
             }
             VStack(alignment: .leading, spacing: 4) {
@@ -168,8 +211,8 @@ struct APRFreeWidgetView: View {
     private var rectangular: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(scope == .total ? "APRFree" : scope.title).font(.caption.weight(.bold))
-            Text("Next due \(WidgetStyle.monthDay(numbers.nextDue, in: zone))").font(.footnote.weight(.semibold))
-            Text("\(scope.freeLabel) \(WidgetStyle.monthYear(numbers.free, in: zone))").font(.caption)
+            Text("Next due \(WidgetStyle.monthDay(numbers.nextDue))").font(.footnote.weight(.semibold))
+            Text("\(scope.freeLabel) \(WidgetStyle.monthYear(numbers.free))").font(.caption)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -187,11 +230,11 @@ struct APRFreeWidgetView: View {
 struct APRFreeWidget: Widget {
     var body: some WidgetConfiguration {
         AppIntentConfiguration(kind: "APRFreeWidget", intent: BalanceWidgetIntent.self, provider: SnapshotProvider()) { entry in
-            APRFreeWidgetView(scope: entry.scope, numbers: entry.numbers, zone: entry.zone)
+            APRFreeWidgetView(scope: entry.scope, numbers: entry.numbers, hidden: entry.hidden)
                 .containerBackground(.background, for: .widget)
         }
         .configurationDisplayName("APRFree")
-        .description("A balance, its next due date and the month it is paid off. Edit the widget to pick total, credit cards or loans.")
+        .description("A balance, its next due date and the month it is paid off. Edit the widget to pick total, credit cards or loans. Tap the eye to hide the amounts.")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular, .accessoryCircular])
     }
 }

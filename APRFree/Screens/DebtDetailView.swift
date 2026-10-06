@@ -67,7 +67,8 @@ struct DebtDetailView: View {
         }
         .sheet(item: $payment) { PaymentSheet(request: $0).tint(Theme.primaryFill) }
         .sheet(isPresented: $charging) { ChargeSheet(debtID: debtID).tint(Theme.primaryFill) }
-        .confirmationDialog("Delete this debt? Its past payments stay in your activity.", isPresented: $confirmingDelete, titleVisibility: .visible) {
+        .confirmationDialog("Delete this debt? Its past payments stay in your activity. You can bring it back with Undo, or from its “deleted” entry in Activity.",
+                            isPresented: $confirmingDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 dismiss()
                 store.delete(debtID)
@@ -180,7 +181,7 @@ private struct PayoffTile: View {
                 }
             } else {
                 TileValue("Not yet")
-                TileNote("Your payday amount doesn’t reach it")
+                TileNote("What goes to debt doesn’t reach it")
             }
         }
     }
@@ -404,7 +405,7 @@ private struct CardCostTile: View {
     }
 
     private func summary(plan: Path?, minimum: Path?) -> String {
-        guard let plan else { return "Your payday amount does not reach this card yet. Raise it in Settings to see a payoff date." }
+        guard let plan else { return "What goes to debt does not reach this card yet. Raise it under Income to see a payoff date." }
         guard let minimum else { return "The \(debt.minimum.usd) minimum never clears this card. Your plan does, in \(Fmt.monthYear(plan.payoff))." }
         // Taken from the two figures as they are shown in the table above, so the sentence agrees with them to the cent.
         let saved = (minimum.interest.cents - plan.interest.cents).cents

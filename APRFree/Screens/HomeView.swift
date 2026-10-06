@@ -5,6 +5,7 @@ struct HomeView: View {
     @Environment(AppStore.self) private var store
     @Binding var route: Route?
     @Binding var payment: PaymentRequest?
+    @State private var confirming: HistoryStep?
 
     var body: some View {
         ScrollView {
@@ -12,7 +13,9 @@ struct HomeView: View {
                 if store.data.debts.isEmpty {
                     emptyState
                 } else {
+                    // Cards are drawn at a fixed size, like the real thing, so their text stops growing where it would collide.
                     CardStack(debts: store.stack, openTotal: { route = .breakdown }) { route = .debt($0.id) }
+                        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
                     loans
                     tools
                 }
@@ -22,6 +25,13 @@ struct HomeView: View {
         }
         .safeAreaInset(edge: .top, spacing: 0) { bar }
         .background(Theme.bg)
+        .historyStepAlert($confirming)
+        // Anything the app corrected on its own is said once, then forgotten.
+        .alert("Due dates corrected", isPresented: Binding(get: { !store.settings.notices.isEmpty }, set: { if !$0 { store.dismissNotices() } })) {
+            Button("OK") { store.dismissNotices() }
+        } message: {
+            Text("An earlier version moved a due date forward with every payment. Dates that went further than your payments allow were pulled back:\n\n\(store.settings.notices.joined(separator: "\n"))\n\nIf one is still not right, change it under Edit on that card or loan.")
+        }
     }
 
     private var bar: some View {
@@ -30,18 +40,28 @@ struct HomeView: View {
                 .font(.system(size: 22, weight: .bold))
                 .tracking(-0.4)
                 .lineLimit(1)
+                .minimumScaleFactor(0.8)
                 .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: 8)
+            Spacer(minLength: 4)
             Button("Make a Payment") { payment = PaymentRequest() }
                 .buttonStyle(GreenPillStyle())
                 .disabled(store.active.isEmpty)
+                .layoutPriority(1)
             Button { route = .addDebt(nil) } label: { GlassCircle(symbol: "plus") }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Add a debt")
             Menu {
+                // The last action, whatever it was, can be taken back from here, and put back again.
+                Button(store.undoLabel.map { "Undo \($0)" } ?? "Undo", systemImage: "arrow.uturn.backward") { confirming = .undo }
+                    .disabled(store.undoLabel == nil)
+                Button(store.redoLabel.map { "Redo \($0)" } ?? "Redo", systemImage: "arrow.uturn.forward") { confirming = .redo }
+                    .disabled(store.redoLabel == nil)
+                Divider()
                 Button("Strategy", systemImage: "list.number") { route = .strategy }
                 Button("Simulator", systemImage: "slider.horizontal.3") { route = .simulator }
                 Button("Insights", systemImage: "lightbulb") { route = .insights }
+                Button("Income", systemImage: "banknote") { route = .income }
+                Button("Extra Money", systemImage: "plus.circle") { route = .extraMoney }
                 Button("Export", systemImage: "square.and.arrow.up") { route = .export }
                 Divider()
                 Button("Settings", systemImage: "gearshape") { route = .settings }
@@ -55,6 +75,8 @@ struct HomeView: View {
         .padding(.top, 4)
         .padding(.bottom, 20)
         .background { TopBarFade() }
+        // The bar is one fixed row. Past this size the main button's name would be cut short.
+        .dynamicTypeSize(...DynamicTypeSize.xLarge)
     }
 
     @ViewBuilder private var loans: some View {
@@ -80,9 +102,19 @@ struct HomeView: View {
             }
             HStack(spacing: 12) {
                 ToolPass(symbol: "lightbulb", title: "Insights", detail: quickWinText) { route = .insights }
+                ToolPass(symbol: "banknote", title: "Income", detail: incomeText) { route = .income }
+            }
+            HStack(spacing: 12) {
+                ToolPass(symbol: "plus.circle", title: "Extra Money", detail: "Where should it go?") { route = .extraMoney }
                 ToolPass(symbol: "square.and.arrow.up", title: "Export", detail: backupText) { route = .export }
             }
         }
+    }
+
+    private var incomeText: String {
+        if store.settings.useFixedAmount { return "\(store.settings.fixedAmount.usd) a month" }
+        guard let next = store.upcomingPaydays(1).first, store.hasIncome else { return "Add your income" }
+        return "Next payday \(Fmt.monthDay(next.day.date))"
     }
 
     private var debtFreeText: String {

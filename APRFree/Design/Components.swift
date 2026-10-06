@@ -77,6 +77,8 @@ struct GreenPillStyle: ButtonStyle {
             configuration.label
                 .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
+                // On the narrowest iPhones the bar is a few points short. The name shrinks a little rather than being cut off.
+                .minimumScaleFactor(0.75)
                 .padding(.horizontal, 15)
                 .frame(height: 44)
                 .foregroundStyle(Theme.onGreen)

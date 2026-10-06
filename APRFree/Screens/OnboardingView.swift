@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// First-run setup, six steps: welcome, debts, payday, safety buffer, strategy, reminders.
+/// First-run setup, eight steps: welcome, privacy policy, disclaimer, debts, payday, safety buffer,
+/// strategy, reminders. The policy and the disclaimer each have to be accepted to go on.
 /// Every value asked for can be typed in here; nothing is deferred to after setup.
 /// All movement comes from `OnboardingMotion`.
 struct OnboardingView: View {
@@ -18,6 +19,8 @@ struct OnboardingView: View {
     @State private var adding: AddRequest?
     @State private var editing: Debt?
     @State private var heroShown = false
+    @State private var acceptedPrivacy = false
+    @State private var acceptedDisclaimer = false
     @FocusState private var focused: Bool
 
     private struct AddRequest: Identifiable {
@@ -25,8 +28,18 @@ struct OnboardingView: View {
         let kind: DebtKind
     }
 
-    private let stepCount = 6
+    private let stepCount = 8
     private var hasDebts: Bool { !store.data.debts.isEmpty }
+
+    /// What still stops the main button on this step.
+    private var blocked: Bool {
+        switch step {
+        case 1: !acceptedPrivacy
+        case 2: !acceptedDisclaimer
+        case 3: !hasDebts
+        default: false
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -85,9 +98,12 @@ struct OnboardingView: View {
             StepDots(count: stepCount, index: step)
                 .animation(OnboardingMotion.progress, value: step)
                 .padding(.bottom, 10)
+            // Accepting sits here, above the button, so the text does not have to be scrolled to its end first.
+            if step == 1 { LegalAcceptRow(text: Legal.privacy.accept, accepted: $acceptedPrivacy) }
+            if step == 2 { LegalAcceptRow(text: Legal.disclaimer.accept, accepted: $acceptedDisclaimer) }
             Button(primaryTitle) { primary() }
                 .buttonStyle(SetupButtonStyle())
-                .disabled(step == 1 && !hasDebts)
+                .disabled(blocked)
             if let secondaryTitle {
                 Button(secondaryTitle) { secondary() }
                     .buttonStyle(SetupButtonStyle(kind: .gray))
@@ -100,17 +116,17 @@ struct OnboardingView: View {
 
     private var primaryTitle: String {
         switch step {
-        case 1: "Done"
-        case 5: "Allow Notifications"
+        case 3: "Done"
+        case 7: "Allow Notifications"
         default: "Continue"
         }
     }
 
     private var secondaryTitle: String? {
         switch step {
-        case 1: hasDebts ? nil : "Skip"
-        case 3: "Skip"
-        case 5: "Not Now"
+        case 3: hasDebts ? nil : "Skip"
+        case 5: "Skip"
+        case 7: "Not Now"
         default: nil
         }
     }
@@ -118,10 +134,12 @@ struct OnboardingView: View {
     @ViewBuilder private var stepContent: some View {
         switch step {
         case 0: welcome
-        case 1: debts
-        case 2: payday
-        case 3: safetyBuffer
-        case 4: strategyStep
+        case 1: legal(Legal.privacy, "How APRFree handles what you enter. Please read it, then accept below to continue.")
+        case 2: legal(Legal.disclaimer, "What APRFree is, and what it is not. Please read it, then accept below to continue.")
+        case 3: debts
+        case 4: payday
+        case 5: safetyBuffer
+        case 6: strategyStep
         default: reminders
         }
     }
@@ -174,7 +192,18 @@ struct OnboardingView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: 2. Debts
+    // MARK: 2 and 3. Privacy policy and disclaimer
+
+    private func legal(_ document: Legal.Document, _ note: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            heading(document.title, note)
+            LegalText(document: document)
+                .padding(16)
+                .background(Theme.card, in: RoundedRectangle(cornerRadius: Theme.cornerRadius, style: .continuous))
+        }
+    }
+
+    // MARK: 4. Debts
 
     /// Pick a type, fill in its details, and repeat for as many debts as you like. Done moves on.
     private var debts: some View {
@@ -249,7 +278,7 @@ struct OnboardingView: View {
         .frame(minHeight: 56)
     }
 
-    // MARK: 3. Payday
+    // MARK: 5. Payday
 
     private var payday: some View {
         let preview = PaydaySequence(first: nextPayday, frequency: frequency)
@@ -293,7 +322,7 @@ struct OnboardingView: View {
                 Text("Your paydays: \((0..<3).map { Fmt.weekday(preview.date($0)) }.joined(separator: " · "))")
                     .font(.footnote.weight(.semibold))
                 Text(rhythm)
-                Text("Used for payday reminders and to split each paycheck. Change it anytime in Settings.")
+                Text("Used for payday reminders and to split each paycheck. You can change it, or add more incomes, under Income later.")
             }
             .font(.footnote)
             .foregroundStyle(Theme.secondary)
@@ -334,7 +363,7 @@ struct OnboardingView: View {
         .background(Theme.fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
-    // MARK: 4. Safety buffer
+    // MARK: 6. Safety buffer
 
     private var safetyBuffer: some View {
         VStack(spacing: 0) {
@@ -363,7 +392,7 @@ struct OnboardingView: View {
         }
     }
 
-    // MARK: 5. Strategy
+    // MARK: 7. Strategy
 
     private var strategyStep: some View {
         VStack(spacing: 10) {
@@ -394,7 +423,7 @@ struct OnboardingView: View {
         }
     }
 
-    // MARK: 6. Reminders
+    // MARK: 8. Reminders
 
     private var reminders: some View {
         VStack(spacing: 10) {
@@ -451,10 +480,10 @@ struct OnboardingView: View {
 
     private func secondary() {
         switch step {
-        case 3:
+        case 5:
             buffer = 0
             go(1)
-        case 5:
+        case 7:
             finish(reminders: false)
         default:
             go(1)
@@ -465,9 +494,12 @@ struct OnboardingView: View {
         focused = false
         withAnimation(OnboardingMotion.finish) {
             store.updateSettings {
-                $0.payFrequency = frequency
-                $0.setNextPayday(nextPayday)
-                $0.payAmount = max(0, payAmount)
+                // The payday step becomes the first income. More can be added later under Income.
+                $0.incomes = [Income(amount: max(0, payAmount), frequency: frequency, nextPayday: nextPayday,
+                                     monthDays: frequency == .monthly ? [Cal.day(of: nextPayday)] : [])]
+                $0.acceptedPrivacy = Date()
+                $0.acceptedDisclaimer = Date()
+                $0.acceptedLegalVersion = Legal.version
                 $0.buffer = max(0, buffer)
                 $0.strategy = strategy
                 $0.remindDueDates = reminders

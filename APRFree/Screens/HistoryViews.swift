@@ -24,8 +24,12 @@ struct ActivityRow: View {
                 IconCircle(symbol: "plus", size: 36)
             case .adjustment:
                 IconCircle(symbol: "pencil", size: 36)
+            case .statement:
+                IconCircle(symbol: "doc.text", size: 36)
             case .added:
                 IconCircle(symbol: "tray.and.arrow.down", size: 36)
+            case .removed:
+                IconCircle(symbol: "trash", size: 36)
             }
             VStack(alignment: .leading, spacing: 0) {
                 Text(forOneDebt ? record.action : record.label).font(.callout).lineLimit(1)
@@ -33,7 +37,7 @@ struct ActivityRow: View {
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 0) {
-                Text(forOneDebt ? record.signedAmount : (record.kind == .adjustment ? record.signedAmount : record.amount.usd))
+                Text(forOneDebt || record.isSigned ? record.signedAmount : record.amount.usd)
                     .font(.callout)
                     .monospacedDigit()
                 if forOneDebt, let after = record.balanceAfter {
@@ -47,23 +51,24 @@ struct ActivityRow: View {
     }
 }
 
-/// An activity row you can tap. A pop-up offers to undo the entry or back out.
+/// An activity row you can tap. A pop-up offers to change the entry, undo it, or back out.
 struct ActivityEntry: View {
     @Environment(AppStore.self) private var store
     let record: PaymentRecord
     var forOneDebt = false
     @State private var asking = false
+    @State private var editing = false
 
     private var blocker: String? { store.undoBlocker(record) }
 
     private var title: String {
-        let amount = record.kind == .adjustment ? record.signedAmount : record.amount.usd
-        return "\(record.label) · \(amount)"
+        "\(record.label) · \(record.isSigned ? record.signedAmount : record.amount.usd)"
     }
 
     /// What undoing will do, in plain terms.
     private var message: String {
         if let blocker { return blocker }
+        if record.kind == .removed { return "Undoing this brings \(record.title) back as it was when it was deleted." }
         guard store.debt(record.debtID) != nil else {
             return "\(record.title) has been deleted, so this only removes the entry from your activity."
         }
@@ -71,13 +76,14 @@ struct ActivityEntry: View {
         var text: String
         switch record.kind {
         case .charge:
-            text = "The \(record.amount.usd) charge comes off \(record.title)."
-        case .adjustment:
-            text = "\(record.title) goes back to the balance it had before this edit."
+            text = "Undoing takes the \(record.amount.usd) charge off \(record.title)."
+        case .adjustment, .statement:
+            text = "Undoing puts \(record.title) back to the balance it had before this."
         default:
-            text = "\(record.title) goes back to how it was before this payment: the balance, and the due date it counted toward."
+            text = "Undoing puts \(record.title) back to how it was before this payment: the balance, and the due date it counted toward."
         }
         if later { text += " Later \(record.title) entries are kept and applied again." }
+        if store.editBlocker(record) == nil { text += " Edit changes the amount or the day instead." }
         return text
     }
 
@@ -87,21 +93,134 @@ struct ActivityEntry: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityHint("Offers to undo this entry")
+        .accessibilityHint("Offers to edit or undo this entry")
         .alert(title, isPresented: $asking) {
+            if store.editBlocker(record) == nil {
+                Button("Edit Entry") { editing = true }
+            }
             if blocker == nil {
-                Button("Undo Activity", role: .destructive) { store.undo(record.id) }
+                Button(record.kind == .removed ? "Bring \(record.title) Back" : "Undo Activity", role: .destructive) { store.undo(record.id) }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(message)
         }
+        .sheet(isPresented: $editing) {
+            EntryEditor(record: record).tint(Theme.primaryFill)
+        }
+    }
+}
+
+/// Changes the amount or the day of a payment or a charge.
+struct EntryEditor: View {
+    @Environment(AppStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    let record: PaymentRecord
+    @State private var amount = 0.0
+    @State private var date = AppClock.today
+    @State private var loaded = false
+    @FocusState private var focused: Bool
+
+    private var earliest: Date { store.debt(record.debtID)?.addedAt ?? record.date }
+    private var changed: Bool { amount.cents != record.amount.cents || Cal.startOfDay(date) != record.date }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    MoneyField(title: "Amount", value: $amount)
+                    DatePicker("Day", selection: $date, in: min(earliest, record.date)...store.today, displayedComponents: .date)
+                } header: {
+                    Text(record.label)
+                } footer: {
+                    Text("\(record.title) is put back to how it was before this entry, then this and every later entry is applied again in date order. What the entry counted as (a minimum, a partial payment, an extra) is worked out again, so it can change.")
+                }
+            }
+            .focused($focused)
+            .scrollDismissesKeyboard(.interactively)
+            .navigationTitle("Edit Entry")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Save") {
+                        store.edit(record.id, amount: amount, date: date)
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                    .disabled(!changed || amount <= 0)
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { focused = false }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .onAppear {
+            guard !loaded else { return }
+            loaded = true
+            amount = record.amount
+            date = record.date
+        }
+    }
+}
+
+/// Undo or Redo of the last action, waiting for a yes.
+enum HistoryStep: Identifiable {
+    case undo, redo
+    var id: Int { self == .undo ? 0 : 1 }
+}
+
+extension View {
+    /// Asks before taking back, or putting back, the last action.
+    func historyStepAlert(_ step: Binding<HistoryStep?>) -> some View {
+        modifier(HistoryStepAlert(step: step))
+    }
+}
+
+private struct HistoryStepAlert: ViewModifier {
+    @Environment(AppStore.self) private var store
+    @Binding var step: HistoryStep?
+
+    func body(content: Content) -> some View {
+        content.alert(step == .redo ? "Redo?" : "Undo last action?",
+                      isPresented: Binding(get: { step != nil }, set: { if !$0 { step = nil } }), presenting: step) { step in
+            if step == .undo {
+                Button("Undo", role: .destructive) { store.undoLast() }
+            } else {
+                Button("Redo") { store.redo() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { step in
+            Text(step == .undo
+                 ? "Are you sure you want to undo “\(store.undoLabel ?? "the last action")”? Everything goes back to how it was just before it. You can redo it afterwards."
+                 : "Put “\(store.redoLabel ?? "the last action")” back the way it was before you undid it?")
+        }
+    }
+}
+
+/// Undo and Redo buttons for a toolbar.
+struct HistoryStepButtons: View {
+    @Environment(AppStore.self) private var store
+    @Binding var step: HistoryStep?
+
+    var body: some View {
+        Button { step = .undo } label: { Image(systemName: "arrow.uturn.backward") }
+            .disabled(store.undoLabel == nil)
+            .accessibilityLabel(store.undoLabel.map { "Undo \($0)" } ?? "Undo")
+        Button { step = .redo } label: { Image(systemName: "arrow.uturn.forward") }
+            .disabled(store.redoLabel == nil)
+            .accessibilityLabel(store.redoLabel.map { "Redo \($0)" } ?? "Redo")
     }
 }
 
 /// The complete activity history: every payment, charge and balance change, grouped by month.
 struct ActivityContent: View {
     @Environment(AppStore.self) private var store
+    @State private var confirming: HistoryStep?
 
     var body: some View {
         let all = store.activity
@@ -113,7 +232,7 @@ struct ActivityContent: View {
                 if all.isEmpty {
                     Tile { TileNote("Payments you mark as paid show up here.") }
                 } else {
-                    Text("\(all.count) \(all.count == 1 ? "entry" : "entries") since \(Fmt.full(all.last?.date ?? store.today)). Tap one to undo it.")
+                    Text("\(all.count) \(all.count == 1 ? "entry" : "entries") since \(Fmt.full(all.last?.date ?? store.today)). Tap one to edit or undo it. The arrows above undo and redo your last action.")
                         .font(.footnote)
                         .foregroundStyle(Theme.secondary)
                         .padding(.horizontal, 4)
@@ -136,6 +255,10 @@ struct ActivityContent: View {
             .padding(.bottom, 32)
         }
         .background(Theme.bg)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) { HistoryStepButtons(step: $confirming) }
+        }
+        .historyStepAlert($confirming)
     }
 }
 

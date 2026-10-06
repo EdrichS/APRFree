@@ -3,10 +3,8 @@ import Foundation
 struct PlanInput {
     var debts: [Debt]
     var today: Date
-    var firstPayday: Date
-    var frequency: PayFrequency
-    /// Money toward debt each payday, with the safety buffer already taken out.
-    var perPayday: Double
+    /// Where the money comes from. Each payday already has the safety buffer taken out.
+    var pay: PaySchedule
     var strategy: Strategy
     var customOrder: [UUID]
     var promoMinimumOnly: Bool
@@ -14,8 +12,35 @@ struct PlanInput {
     var oneTime: Double = 0
     /// Added to the first payday of every month.
     var extraMonthly: Double = 0
-    /// For monthly pay: the day of the month, when the first payday was shortened to fit its month.
-    var anchorDay: Int? = nil
+    /// Leaves out the month-by-month detail, the balances over time and each debt's own payoff date:
+    /// what is left is the total interest and the debt-free date. Enough to compare one plan with
+    /// another, and several times faster.
+    var totalsOnly = false
+
+    init(debts: [Debt], today: Date, pay: PaySchedule, strategy: Strategy, customOrder: [UUID], promoMinimumOnly: Bool,
+         oneTime: Double = 0, extraMonthly: Double = 0, totalsOnly: Bool = false) {
+        self.debts = debts
+        self.today = today
+        self.pay = pay
+        self.strategy = strategy
+        self.customOrder = customOrder
+        self.promoMinimumOnly = promoMinimumOnly
+        self.oneTime = oneTime
+        self.extraMonthly = extraMonthly
+        self.totalsOnly = totalsOnly
+    }
+
+    /// A plan fed by a single income. `perPayday` is what is left for debt each payday.
+    init(debts: [Debt], today: Date, firstPayday: Date, frequency: PayFrequency, perPayday: Double, strategy: Strategy,
+         customOrder: [UUID], promoMinimumOnly: Bool, oneTime: Double = 0, extraMonthly: Double = 0, anchorDay: Int? = nil,
+         totalsOnly: Bool = false) {
+        let first = Day(firstPayday)
+        var monthDay = first.day
+        if let anchorDay, anchorDay >= first.day, Day.inMonth(first.monthIndex, day: anchorDay) == first { monthDay = anchorDay }
+        let line = PaySchedule.Line(first: first, frequency: frequency, monthDays: [monthDay], gross: perPayday, net: perPayday)
+        self.init(debts: debts, today: today, pay: PaySchedule(lines: [line]), strategy: strategy, customOrder: customOrder,
+                  promoMinimumOnly: promoMinimumOnly, oneTime: oneTime, extraMonthly: extraMonthly, totalsOnly: totalsOnly)
+    }
 }
 
 /// Balances on one date of a plan: everything, the cards alone, the loans alone.
@@ -58,6 +83,8 @@ struct PlanResult {
     var paydaysToPayoff: [UUID: Int] = [:]
     /// Balances after each payday, starting with today.
     var series: [PlanPoint] = []
+    /// Per debt: its balance at each point of `series`.
+    var balances: [UUID: [Double]] = [:]
     fileprivate(set) var ledger: [UUID: [Date: MonthSlice]] = [:]
     fileprivate(set) var accruals: [UUID: [Date: Double]] = [:]
 
@@ -76,6 +103,12 @@ struct PlanResult {
         let live = debts.filter { !$0.isPaidOff }
         let dates = live.compactMap { payoff[$0.id] }
         return dates.count == live.count ? dates.max() : nil
+    }
+
+    /// The first date in the plan on which a debt's balance is under `ceiling`. Nil if it never is.
+    func firstDate(_ id: UUID, under ceiling: Double) -> Date? {
+        guard let line = balances[id] else { return nil }
+        return zip(series, line).first { $0.1 < ceiling }?.0.date
     }
 }
 
@@ -113,6 +146,10 @@ struct Split {
     /// How far the amount falls short of the minimums due.
     var shortBy: Double = 0
     var summary: String?
+    /// The incomes this paycheck split uses up. Empty for extra money, which uses up none.
+    var incomes: [UUID] = []
+    /// True for money that is not a paycheck: nothing is held back and no payday is used up.
+    var isExtraMoney = false
 
     var total: Double { lines.reduce(0) { $0 + $1.amount }.cents }
 }
@@ -127,37 +164,39 @@ enum PayoffEngine {
 
     // MARK: Order
 
-    /// Debts in the order a strategy sends extra money to them.
-    static func priority(_ debts: [Debt], strategy: Strategy, customOrder: [UUID], on date: Date) -> [Debt] {
+    /// One ordering rule for every caller, whatever it is ordering.
+    private static func ordered<T>(_ items: [T], strategy: Strategy, rank: [UUID: Int], id: (T) -> UUID,
+                                   balance: (T) -> Double, rate: (T) -> Double) -> [T] {
         switch strategy {
         case .avalanche:
             // By rate. A dollar of extra payment saves interest at the rate of the debt it lands on,
             // whatever that debt's size, so the highest rate first costs the least overall.
-            return debts.sorted { a, b in
-                let x = a.apr(on: date), y = b.apr(on: date)
-                return x != y ? x > y : a.balance < b.balance
-            }
-        case .highestBalance:
-            // By the interest each debt charges in a month (balance x APR / 12): a large balance at 20%
-            // comes ahead of a small one at 30%. It clears the biggest charges first but costs more overall.
-            return debts.sorted { a, b in
-                let x = a.monthlyInterest(on: date), y = b.monthlyInterest(on: date)
-                if x != y { return x > y }
-                let p = a.apr(on: date), q = b.apr(on: date)
-                return p != q ? p > q : a.balance < b.balance
+            return items.sorted { a, b in
+                let x = rate(a), y = rate(b)
+                return x != y ? x > y : balance(a) < balance(b)
             }
         case .snowball:
-            return debts.sorted { a, b in
-                a.balance != b.balance ? a.balance < b.balance : a.apr(on: date) > b.apr(on: date)
+            return items.sorted { a, b in
+                let x = balance(a), y = balance(b)
+                return x != y ? x < y : rate(a) > rate(b)
             }
         case .custom:
-            var rank: [UUID: Int] = [:]
-            for (i, id) in customOrder.enumerated() where rank[id] == nil { rank[id] = i }
-            return debts.sorted { a, b in
-                let x = rank[a.id] ?? Int.max, y = rank[b.id] ?? Int.max
-                return x != y ? x < y : a.apr(on: date) > b.apr(on: date)
+            return items.sorted { a, b in
+                let x = rank[id(a)] ?? Int.max, y = rank[id(b)] ?? Int.max
+                return x != y ? x < y : rate(a) > rate(b)
             }
         }
+    }
+
+    private static func ranks(_ customOrder: [UUID]) -> [UUID: Int] {
+        var rank: [UUID: Int] = [:]
+        for (i, id) in customOrder.enumerated() where rank[id] == nil { rank[id] = i }
+        return rank
+    }
+
+    /// Debts in the order a strategy sends extra money to them.
+    static func priority(_ debts: [Debt], strategy: Strategy, customOrder: [UUID], on date: Date) -> [Debt] {
+        ordered(debts, strategy: strategy, rank: ranks(customOrder), id: \.id, balance: \.balance) { $0.apr(on: date) }
     }
 
     /// Where extra money goes: the strategy order first, then held promo cards, then pay-later plans.
@@ -173,190 +212,283 @@ enum PayoffEngine {
 
     // MARK: Simulation
 
+    /// One debt as the simulation runs. Everything is in whole calendar days.
     private struct Work {
-        /// `debt.balance` is the running balance: principal for a loan, everything for a card.
-        var debt: Debt
+        let id: UUID
+        let isLoan: Bool
+        let isPayLater: Bool
+        let isCard: Bool
+        let apr: Double
+        let promoRate: Double
+        /// The first day the regular rate applies. Nil when there is no promo.
+        let promoEnd: Day?
+        let dueDay: Int
+        let minimum: Double
+        /// The running balance: principal for a loan, everything for a card.
+        var balance: Double
         /// Loan interest charged but not yet paid.
         var accrued = 0.0
-        var due: Date?
-        var installments: [Date]
+        var due: Day?
+        let installments: [Day]
+        var nextInstallment = 0
         /// What is left of the first due date when part of it has already been paid.
         var firstDueLeft: Double?
+        // Month by month, keyed by month index: what was paid, and the interest charged.
+        var paid: [Int: Double] = [:]
+        var interest: [Int: Double] = [:]
 
-        var owed: Double { debt.balance + accrued }
+        var owed: Double { balance + accrued }
 
-        init(_ debt: Debt, today: Date) {
-            self.debt = debt
-            installments = debt.remainingInstallmentDates
-            due = debt.kind == .payLater ? nil : debt.nextUnpaidDue()
-            if debt.kind == .loan, let due {
+        init(_ debt: Debt, today: Day, todayDate: Date) {
+            id = debt.id
+            isLoan = debt.kind == .loan
+            isPayLater = debt.kind == .payLater
+            isCard = debt.kind == .card
+            apr = debt.apr
+            promoRate = debt.promoAPR ?? debt.apr
+            promoEnd = debt.promoAPR != nil ? debt.promoEnd.map { Day($0) } : nil
+            dueDay = debt.dueDay
+            minimum = debt.minimum
+            balance = debt.balance
+            // The same dates as `remainingInstallmentDates` and `nextUnpaidDue`, worked out in whole days.
+            if isPayLater, let first = debt.nextDue.map({ Day($0) }), let step = debt.every {
+                let left = max(0, (debt.installments ?? 0) - (debt.paidInstallments ?? 0))
+                installments = (0..<left).map { n in
+                    switch step {
+                    case .weekly: first.adding(days: 7 * n)
+                    case .biweekly: first.adding(days: 14 * n)
+                    case .monthly: first.adding(months: n)
+                    }
+                }
+            } else {
+                installments = []
+            }
+            if isPayLater || debt.isPaidOff {
+                due = nil
+            } else {
+                due = Day.next(dayOfMonth: debt.dueDay, onOrAfter: debt.paidThrough.map { Day($0).adding(days: 1) } ?? Day(debt.addedAt))
+            }
+            if isLoan, let due {
                 // The stored loan balance is principal as of the last payment, so the interest
                 // that has built up since then is owed on top of it.
-                let last = debt.paidThrough ?? Cal.date(inMonthOf: due, monthOffset: -1, day: debt.dueDay)
-                let days = min(max(0, Cal.days(from: last, to: today)), 366)
-                accrued = max(0, debt.balance * debt.apr(on: today) / 36500 * Double(days) - (debt.interestTowardDue ?? 0))
+                let last = debt.paidThrough.map { Day($0) } ?? Day.inMonth(due.monthIndex - 1, day: debt.dueDay)
+                let days = min(max(0, last.days(to: today)), 366)
+                accrued = max(0, debt.balance * rate(on: today) / 36500 * Double(days) - (debt.interestTowardDue ?? 0))
             }
-            if (debt.paidTowardDue ?? 0) > 0 { firstDueLeft = debt.scheduledPayment(on: today) }
+            if (debt.paidTowardDue ?? 0) > 0 { firstDueLeft = debt.scheduledPayment(on: todayDate) }
         }
+
+        func rate(on day: Day) -> Double {
+            if let promoEnd, day < promoEnd { return promoRate }
+            return apr
+        }
+
+        func hasPromo(on day: Day) -> Bool { promoEnd.map { day < $0 } ?? false }
 
         /// The size of the next scheduled payment: the minimum, or what is left of a partly paid one.
         private mutating func nextAmount() -> Double {
             defer { firstDueLeft = nil }
-            return firstDueLeft ?? debt.minimum
+            return firstDueLeft ?? minimum
         }
 
         /// What is due before `limit`, removed from the schedule.
-        mutating func takeDues(before limit: Date) -> Double {
-            if debt.kind == .payLater {
-                var sum = 0.0
-                while let first = installments.first, first < limit {
+        mutating func takeDues(before limit: Day) -> Double {
+            var sum = 0.0
+            if isPayLater {
+                while nextInstallment < installments.count, installments[nextInstallment] < limit {
                     sum += nextAmount()
-                    installments.removeFirst()
+                    nextInstallment += 1
                 }
                 guard sum > 0 else { return 0 }
                 // The last installment clears whatever is left, odd cents included.
-                return installments.isEmpty ? owed : min(sum, owed)
+                return nextInstallment >= installments.count ? owed : min(sum, owed)
             }
-            var sum = 0.0
             while let d = due, d < limit {
                 sum += nextAmount()
-                due = Cal.nextDue(day: debt.dueDay, onOrAfter: Cal.addDays(1, to: d))
+                due = Day.next(dayOfMonth: dueDay, onOrAfter: d.adding(days: 1))
             }
             return min(sum, owed)
         }
 
         /// Interest first, then principal.
         mutating func pay(_ amount: Double) {
-            let interest = min(amount, accrued)
-            accrued -= interest
-            debt.balance -= amount - interest
+            let part = min(amount, accrued)
+            accrued -= part
+            balance -= amount - part
+        }
+
+        /// Interest for the days from `from` up to but not including `to`, at the one rate that holds
+        /// across them. A card compounds daily, so n days multiply the balance by (1 + rate)^n; a
+        /// loan charges simple interest on its principal.
+        mutating func accrue(from: Day, to: Day) -> Double {
+            let rate = rate(on: from)
+            guard rate > 0, to > from else { return 0 }
+            let days = Double(from.days(to: to))
+            let charged: Double
+            if isLoan {
+                charged = balance * rate / 36500 * days
+                accrued += charged
+            } else {
+                charged = balance * (pow(1 + rate / 36500, days) - 1)
+                balance += charged
+            }
+            return charged
         }
 
         /// The due date a final payment made on `payday` covers.
-        func coveredDue(payday: Date) -> Date {
-            if debt.kind == .payLater { return max(payday, debt.remainingInstallmentDates.last ?? payday) }
-            return Cal.nextDue(day: debt.dueDay, onOrAfter: payday)
+        func coveredDue(payday: Day) -> Day {
+            if isPayLater { return max(payday, installments.last ?? payday) }
+            return Day.next(dayOfMonth: dueDay, onOrAfter: payday)
         }
     }
 
     static func simulate(_ input: PlanInput) -> PlanResult {
         var result = PlanResult()
-        var work = input.debts.filter { !$0.isPaidOff }.map { Work($0, today: input.today) }
+        let today = Day(input.today)
+        let detail = !input.totalsOnly
+        var work = input.debts.filter { !$0.isPaidOff }.map { Work($0, today: today, todayDate: input.today) }
         func owed() -> Double { work.reduce(0) { $0 + $1.owed } }
-        func point(_ date: Date) -> PlanPoint {
-            var p = PlanPoint(date: date, total: 0)
+        func point(_ day: Day) -> PlanPoint {
+            var p = PlanPoint(date: day.date, total: 0)
             for w in work {
-                p.total += w.debt.balance
-                if w.debt.kind == .card { p.cards += w.debt.balance }
-                if w.debt.kind == .loan { p.loans += w.debt.balance }
+                p.total += w.balance
+                if w.isCard { p.cards += w.balance }
+                if w.isLoan { p.loans += w.balance }
             }
             return p
         }
+        func note(_ day: Day) {
+            guard detail else { return }
+            result.series.append(point(day))
+            for w in work { result.balances[w.id, default: []].append(w.balance) }
+        }
 
-        result.series = [point(input.today)]
+        note(today)
         guard !work.isEmpty else {
             result.finished = true
             return result
         }
         // With no money going in, nothing is ever paid: there is no plan to work out.
-        guard input.perPayday + input.oneTime + input.extraMonthly > 0.005 else { return result }
-        let paydays = PaydaySequence(first: input.firstPayday, frequency: input.frequency, anchorDay: input.anchorDay)
-            .starting(onOrAfter: input.today)
-        var day = input.today
+        guard input.pay.hasMoney || input.oneTime + input.extraMonthly > 0.005 else { return result }
+        // An amount to try with no income behind it still needs dates to land on: once a month, from today.
+        let schedule = input.pay.lines.isEmpty ? PaySchedule(lines: [.init(first: today, frequency: .monthly)]) : input.pay
+        var cursor = schedule.cursor(from: today)
+        guard var event = cursor.next() else { return result }
+        var previous = cursor.previous
+        let rank = ranks(input.customOrder)
+
+        var day = today
         var index = 0
-        // A plan that works shrinks what is owed every payday. If a whole stretch of paydays goes by
-        // without a new low, the payments are not keeping up with the interest and never will.
+        var payoffPayday: [UUID: Day] = [:], payoff: [UUID: Day] = [:]
+        // A plan that works shrinks what is owed. If a whole year of paydays goes by without a new
+        // low, the payments are not keeping up with the interest and never will.
         var lowest = owed()
-        var paydaysSinceLow = 0
+        var lowestDay = today
+        let horizon = today.adding(days: 366 * 60)
 
-        func record(_ i: Int, month: Date, paid: Double = 0, interest: Double = 0) {
-            let id = work[i].debt.id
-            var slice = result.ledger[id]?[month] ?? MonthSlice(month: month, interest: 0, principal: 0)
-            // `principal` holds everything paid until the slices are finalized below.
-            slice.principal += paid
-            slice.interest += interest
-            result.ledger[id, default: [:]][month] = slice
-        }
+        while owed() > 0.005 && index < 5000 && event.day <= horizon {
+            guard let next = cursor.next() else { break }
+            let payday = event.day
 
-        while owed() > 0.005 && index < 720 {
-            let payday = paydays.date(index)
-            let next = paydays.date(index + 1)
-
+            // Interest up to this payday, a calendar month at a time so each month gets its own share,
+            // and split again where a promo rate ends.
             while day < payday {
-                let month = Cal.monthStart(day)
-                for i in work.indices where work[i].debt.balance > 0 {
-                    let rate = work[i].debt.apr(on: day)
-                    guard rate > 0 else { continue }
-                    let interest = work[i].debt.balance * rate / 36500
-                    if work[i].debt.kind == .loan {
-                        work[i].accrued += interest
+                let end = min(payday, Day.inMonth(day.monthIndex + 1, day: 1))
+                let month = day.monthIndex
+                for i in work.indices where work[i].balance > 0 {
+                    var charged = 0.0
+                    if let cut = work[i].promoEnd, cut > day, cut < end {
+                        charged = work[i].accrue(from: day, to: cut) + work[i].accrue(from: cut, to: end)
                     } else {
-                        work[i].debt.balance += interest
+                        charged = work[i].accrue(from: day, to: end)
                     }
-                    result.totalInterest += interest
-                    result.accruals[work[i].debt.id, default: [:]][month, default: 0] += interest
-                    record(i, month: month, interest: interest)
+                    guard charged != 0 else { continue }
+                    result.totalInterest += charged
+                    if detail { work[i].interest[month, default: 0] += charged }
                 }
-                day = Cal.addDays(1, to: day)
+                day = end
             }
 
-            var pot = input.perPayday
+            var pot = event.net
             if index == 0 { pot += input.oneTime }
-            if input.extraMonthly > 0 && paydays.isFirstInMonth(index) { pot += input.extraMonthly }
-            let month = Cal.monthStart(payday)
+            if input.extraMonthly > 0, previous.map({ $0.monthIndex != payday.monthIndex }) ?? true { pot += input.extraMonthly }
+            let month = payday.monthIndex
 
+            // Everything due before the next payday.
             for i in work.indices where work[i].owed > 0.005 {
-                let pay = min(work[i].takeDues(before: next), work[i].owed, pot)
+                let pay = min(work[i].takeDues(before: next.day), work[i].owed, pot)
                 guard pay > 0 else { continue }
                 work[i].pay(pay)
                 pot -= pay
-                record(i, month: month, paid: pay)
+                if detail { work[i].paid[month, default: 0] += pay }
             }
 
-            let queue = extraQueue(work.map(\.debt), strategy: input.strategy, customOrder: input.customOrder,
-                                   promoMinimumOnly: input.promoMinimumOnly, on: payday)
-            for target in queue {
-                guard pot > 0.005, let i = work.firstIndex(where: { $0.debt.id == target.id }) else { continue }
-                let pay = min(pot, work[i].owed)
-                work[i].pay(pay)
-                pot -= pay
-                record(i, month: month, paid: pay)
+            // The rest, down the strategy order: held promo cards after it, pay-later plans last.
+            if pot > 0.005 {
+                var main: [Int] = [], held: [Int] = [], later: [Int] = []
+                for i in work.indices where work[i].balance > 0.005 {
+                    if work[i].isPayLater {
+                        later.append(i)
+                    } else if input.promoMinimumOnly && work[i].hasPromo(on: payday) {
+                        held.append(i)
+                    } else {
+                        main.append(i)
+                    }
+                }
+                let queue = ordered(main, strategy: input.strategy, rank: rank, id: { work[$0].id }, balance: { work[$0].balance },
+                                    rate: { work[$0].rate(on: payday) }) + held + later
+                for i in queue {
+                    guard pot > 0.005 else { break }
+                    let pay = min(pot, work[i].owed)
+                    work[i].pay(pay)
+                    pot -= pay
+                    if detail { work[i].paid[month, default: 0] += pay }
+                }
             }
 
-            for i in work.indices where work[i].owed <= 0.005 && result.payoffPayday[work[i].debt.id] == nil {
-                let id = work[i].debt.id
-                work[i].debt.balance = 0
+            for i in work.indices where work[i].owed <= 0.005 && payoffPayday[work[i].id] == nil {
+                work[i].balance = 0
                 work[i].accrued = 0
-                result.payoffPayday[id] = payday
-                result.payoff[id] = max(payday, work[i].coveredDue(payday: payday))
-                result.paydaysToPayoff[id] = index + 1
+                payoffPayday[work[i].id] = payday
+                payoff[work[i].id] = max(payday, work[i].coveredDue(payday: payday))
+                result.paydaysToPayoff[work[i].id] = index + 1
             }
 
-            result.series.append(point(payday))
+            note(payday)
             index += 1
+            previous = payday
+            event = next
 
             let now = owed()
             if now < lowest - 0.005 {
                 lowest = now
-                paydaysSinceLow = 0
-            } else {
-                paydaysSinceLow += 1
-                if paydaysSinceLow >= 26 { break }
+                lowestDay = payday
+            } else if lowestDay.days(to: payday) > 366 {
+                break
             }
         }
 
-        // Turn "everything paid" into principal by taking the month's interest out of it.
-        for (id, months) in result.ledger {
-            for (month, slice) in months {
-                let interest = min(slice.interest, slice.principal)
-                result.ledger[id]?[month] = MonthSlice(month: month, interest: interest, principal: slice.principal - interest)
+        if detail {
+            // Each month's slice: what was paid, with the interest charged that month taken out of it first.
+            for w in work {
+                for month in Set(w.paid.keys).union(w.interest.keys) {
+                    let date = Day.inMonth(month, day: 1).date
+                    let paid = w.paid[month] ?? 0, charged = w.interest[month] ?? 0
+                    let part = min(charged, paid)
+                    result.ledger[w.id, default: [:]][date] = MonthSlice(month: date, interest: part, principal: paid - part)
+                    if charged != 0 { result.accruals[w.id, default: [:]][date] = charged }
+                }
             }
+        }
+        if detail {
+            for (id, day) in payoffPayday { result.payoffPayday[id] = day.date }
+            for (id, day) in payoff { result.payoff[id] = day.date }
         }
 
         if owed() <= 0.005 {
             result.finished = true
-            result.finalPayday = result.payoffPayday.values.max()
-            result.debtFree = result.payoff.values.max()
+            result.finalPayday = payoffPayday.values.max()?.date
+            result.debtFree = payoff.values.max()?.date
         }
         return result
     }
@@ -365,11 +497,11 @@ enum PayoffEngine {
 
     /// Splits a payday amount: every scheduled payment due before the next payday, then the rest as extra.
     static func split(amount: Double, debts: [Debt], settings: PlanSettings, today: Date) -> Split {
-        let paydays = settings.paydays(from: today)
-        let payday = paydays.date(0), next = paydays.date(1)
-        let buffer = min(settings.buffer, amount)
+        let window = settings.schedule(today: today).window(from: Day(today))
+        let payday = window.payday.date, next = window.next.date
+        let buffer = min(settings.activeBuffer, amount)
         var pot = max(0, amount - buffer).cents
-        var split = Split(payday: payday, nextPayday: next, amount: amount, bufferKept: buffer)
+        var split = Split(payday: payday, nextPayday: next, amount: amount, bufferKept: buffer, incomes: window.event?.lines ?? [])
 
         // Running copies, so a second payment to the same debt sees the first.
         var live = debts.filter { !$0.isPaidOff }
@@ -406,12 +538,50 @@ enum PayoffEngine {
             split.lines.append(SplitLine(debtID: d.id, title: d.title, detail: detail, amount: pay, isExtra: false, dueDate: due.date))
         }
 
-        // Whatever is left goes down the strategy order, straight onto the balance.
+        addExtras(&split, pot: pot, live: &live, settings: settings, on: payday, today: today)
+        split.shortBy = split.shortBy.cents
+        return split
+    }
+
+    /// What to do with money that is not a paycheck: anything already overdue first, because that is
+    /// where late fees come from, then all of the rest down the strategy order. Nothing is held back,
+    /// and no payday is used up.
+    static func extraSplit(amount: Double, debts: [Debt], settings: PlanSettings, today: Date) -> Split {
+        let window = settings.schedule(today: today).window(from: Day(today))
+        var pot = max(0, amount).cents
+        var split = Split(payday: today, nextPayday: window.payday.date, amount: amount, bufferKept: 0, isExtraMoney: true)
+        var live = debts.filter { !$0.isPaidOff }
+
+        let overdue = live.enumerated()
+            .compactMap { offset, d -> (Int, Date)? in
+                guard let due = d.kind == .payLater ? d.remainingInstallmentDates.first : d.nextUnpaidDue(), due < today,
+                      d.countsTowardDue(on: today) else { return nil }
+                return (offset, due)
+            }
+            .sorted { $0.1 < $1.1 }
+        for (i, due) in overdue {
+            let d = live[i]
+            let pay = min(d.scheduledPayment(on: today), pot).cents
+            guard pay > 0 else { continue }
+            pot = (pot - pay).cents
+            live[i].pay(pay, on: today)
+            split.lines.append(SplitLine(debtID: d.id, title: d.title, detail: "Overdue since \(Fmt.monthDay(due))", amount: pay,
+                                         isExtra: false, dueDate: due))
+        }
+
+        addExtras(&split, pot: pot, live: &live, settings: settings, on: today, today: today)
+        return split
+    }
+
+    /// Sends what is left of a split down the strategy order, straight onto the balances.
+    private static func addExtras(_ split: inout Split, pot: Double, live: inout [Debt], settings: PlanSettings, on date: Date,
+                                  today: Date) {
+        var pot = pot
         let queue = extraQueue(live, strategy: settings.strategy, customOrder: settings.customOrder,
-                               promoMinimumOnly: settings.promoMinimumOnly, on: payday)
+                               promoMinimumOnly: settings.promoMinimumOnly, on: date)
         var first = true
         for target in queue {
-            guard pot > 0.005, let i = index(target.id), live[i].balance > 0.005 else { continue }
+            guard pot > 0.005, let i = live.firstIndex(where: { $0.id == target.id }), live[i].balance > 0.005 else { continue }
             let pay = min(pot, live[i].balance).cents
             live[i].pay(pay, on: today)
             pot = (pot - pay).cents
@@ -424,8 +594,6 @@ enum PayoffEngine {
                 first = false
             }
         }
-        split.shortBy = split.shortBy.cents
-        return split
     }
 
     // MARK: One debt at a time
@@ -490,9 +658,9 @@ enum PayoffEngine {
             let month = Cal.monthStart(record.date)
             let rate = debt.apr(on: record.date) / 1200
             switch record.kind {
-            case .added:
+            case .added, .removed:
                 continue
-            case .charge, .adjustment:
+            case .charge, .adjustment, .statement:
                 balance -= record.amount
                 continue
             case .minimum, .installment, .payment, .partial, .extra:

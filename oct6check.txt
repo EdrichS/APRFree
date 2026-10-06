@@ -1,0 +1,285 @@
+APRFree: full check, October 6, 2026
+====================================
+
+Everything that was checked after the October 6 feature round, what was found, what was fixed,
+what was left alone and why, and what to do next. The earlier review is in checkup_oct5.txt.
+
+
+1. RESULT IN SHORT
+------------------
+- 67 automated tests pass (63 before this check, 4 added). They also pass under the address,
+  undefined-behaviour and thread sanitizers.
+- The static analyzer reports nothing. Debug and Release builds have no warnings.
+- No memory leaks, and memory stays flat when screens are opened and closed repeatedly.
+- 21 problems found and fixed in this check: 10 in logic, 11 in the interface. None was a crash and
+  none produced a wrong sum. The most important three:
+    1. Undo could silently put back settings you had changed since (reminders off came back on).
+    2. Reset Everything left a copy of your old data, and any exports, on the iPhone.
+    3. On the smallest iPhone the main button read "Make a Pay..." at the normal text size.
+- Two new kinds of test did the heavy lifting. One runs 1,320 random actions and checks the data
+  after every one. The other checks the rewritten payoff engine against the original day-by-day
+  method on 160 made-up situations. Both pass.
+- Nothing has run on a real iPhone. Section 7 lists what was not verified.
+
+
+2. HOW IT WAS CHECKED
+---------------------
+
+2.1 Automated
+- Full suite on the iPhone 17 simulator (iOS 26.3): 67 of 67.
+- Again with Address Sanitizer and Undefined Behavior Sanitizer: 67 pass, no reports.
+- Again with Thread Sanitizer: 67 pass, no reports.
+- Clean build with the static analyzer: no warnings.
+- Release build: succeeds, no warnings.
+
+2.2 Random use (new)
+One test plays the app at random: 6 runs of 220 actions each, 1,320 in all. The actions are paying,
+charging, editing a debt, undoing an entry, editing an entry's amount and day, statement check-ins,
+paycheck splits with some lines left unpaid, extra-money splits, Undo, Redo, adding and deleting
+debts, changing strategy and custom order, adding and removing incomes, switching to a fixed
+amount, and moving the clock forward up to three weeks at a time.
+After every action it checks that:
+- no balance is negative, and every balance is a whole number of cents;
+- the last entry for each debt left exactly the balance the debt has now;
+- the balance history ends today, on today's totals, in date order, never below zero;
+- a debt that owes money has no "paid off" date; installments paid never exceed installments;
+- the undo history never holds more than its limit.
+Every fourth action it also checks that:
+- the data, saved and read back, is identical;
+- a plan can be worked out, with interest that is a real, non-negative number;
+- a $900 paycheck split never hands out more than is left after the buffer;
+- each month's statement starts where the previous one ended, and the newest ends on today's total.
+And after one action in five it takes the action back and puts it back, and checks the debts, the
+entries and the settings are exactly where they were.
+The numbers come from a fixed seed, so any failure can be run again exactly.
+
+2.3 The engine against the original method (new)
+The payoff engine was rewritten on October 6 to take each stretch between paydays in one step.
+The original, which walked one day at a time, was put back as a test-only reference. 160 made-up
+situations are run through both: random balances, rates and due days, promo rates ending partway,
+part-paid minimums, pay-later plans on all three rhythms, weekly, two-weekly and monthly paydays,
+all three strategies. Whether the plan finishes, the total interest (to the cent) and the payday
+each debt is paid off must agree. They do, in all 160. More than half are plans that finish.
+
+2.4 Memory
+- Apple's "leaks" tool against the running app after: Statements, a statement in full, the
+  check-in sheet, a complete paycheck split marked paid. Result: 0 leaks.
+- Opened and closed a statement three times: 183,711 blocks (30,208 KB) after the first,
+  183,737 blocks (30,193 KB) after the third. Flat.
+- In the source: still one class, no stored closures, no timers. One observer was added (for
+  midnight passing while the app is open); SwiftUI owns it and removes it with the view.
+
+2.5 Reading the code
+- Every file changed or added on October 6 was read again with one question each: what happens
+  with nothing, with one, with many, at a month end, after an undo, and after a restart.
+- Scanned every source file again for force unwraps, try!, fatalError (none), for network,
+  tracking and location code (none), and for every place a setting is changed without becoming an
+  undo step (found four; see 3.1).
+
+2.6 On screen
+Simulators: iPhone 17 (402 x 874) and, new for this check, iPhone SE 3rd generation (375 x 667, the
+smallest screen that runs iOS 26).
+- Light mode, every main screen: Home, Progress, Statements, Strategy, Simulator, Insights, Income,
+  Extra Money, Export, Settings.
+- Dark mode: Home, Statements, Income, Extra Money, Activity; a card's detail and Progress on the SE.
+- Large text (the "accessibility large" size): Home, Statements, Income, Make a Payment, Settings.
+- Done by hand, start to finish:
+    * Statement check-in: opened the sheet, typed a new balance for one card, saved. The statement
+      then showed interest up by exactly the $32.00 entered and the balance up by the same.
+    * Income: opened an income, switched it to monthly, added a second pay day, saved; then Undo
+      from the Home menu, with its confirmation; the menu then offered Redo.
+    * Make a Payment as a paycheck: the split, Mark All Paid, Done. Balances fell by exactly the
+      lines paid, and the menu offered "Undo Payday split" as one step.
+    * Extra Money: an amount, "See Where It Goes", the interest it saves.
+    * Setup: welcome, privacy policy and disclaimer, each blocking Continue until ticked.
+    * Editing an entry from a statement: the pop-up, then the editor.
+    * The widget's eye: both widgets on the Home Screen hid and showed together.
+- A copy of your own saved data was run through the upgrade in a test, not on the real file:
+  9 debts and $24,839.75 came through unchanged, and one due date was corrected (Chase, from
+  Feb 9, 2027 back to Nov 9, 2026). Your real file had still not been rewritten when this was
+  written; that happens the first time you change something, and the old one is kept beside it.
+
+
+3. WHAT WAS FOUND AND FIXED IN THIS CHECK
+-----------------------------------------
+
+3.1 Logic
+ 1. Undo put back things that are not part of the plan. Each undo step keeps a full copy of the
+    data. Taking one back also took back anything else changed since: a reminder switch, the date
+    of the last backup, a notice already read, even acceptance of the privacy policy. Undo and
+    Redo now move the debts, the entries and the plan, and leave those alone.
+ 2. Four plan settings were not undo steps: the safety buffer (in two places), the fixed monthly
+    amount, and the "minimum only on 0% promo cards" switch. Changing one and then undoing an
+    earlier action silently reverted it. Each is now a step of its own. Typing a new buffer and
+    then correcting it counts as one step, not two.
+ 3. Undo could bring back a payday that had since passed. If a step was taken before a payday and
+    undone after it, the old payday came back. Paydays are now moved on after every Undo and Redo.
+ 4. Reset Everything did not erase everything. It left the copy of your data kept from before the
+    upgrade, a file set aside as unreadable if there was one, and any CSV or PDF still waiting in
+    the temporary folder. All are now removed, exports are kept in a folder of their own so they
+    can be found to remove, and the widget's "hidden" switch is put back.
+ 5. Restoring a backup made before the privacy policy existed sent you back through the policy and
+    the disclaimer. What has been accepted on this iPhone now stays accepted across a restore.
+ 6. The widget would show wrong dates on an iPhone set to the Buddhist or Japanese calendar. It
+    turned a calendar day into a date using the iPhone's own calendar, where the year 2026 means
+    something else. It now uses the Gregorian calendar, which is what the days are.
+ 7. A debt's amounts were not always held to the cent. Found by the random test: a minimum of
+    17.869999999999997 in memory was saved and read back as 17.87, so the data was not identical
+    after a restart. Nothing typed in the app produces such a number, but nothing prevented one
+    either. Adding and editing a debt now round every money field to the cent.
+ 8. The statement check-in waited for loans. "Check In 7 Balances" counted two loans, whose
+    interest the app already works out itself, payment by payment. It now waits for cards only.
+    Loans can still be checked in. Paid-off loans are no longer listed; a card at $0.00 still is,
+    because it can have a new balance.
+ 9. Extra Money with no income set said "your next payday stays" followed by today's date. It now
+    leaves that out. A split with nothing in it now says why, instead of showing an empty list.
+10. With the app left open on screen past midnight, it stayed on yesterday's plan until closed and
+    reopened. It now notices midnight.
+
+3.2 Interface
+11. The top of the check-in sheet was cut off at the left edge of the screen.
+12. Check-in fields were filled with the current figures, so typing a new balance added digits to
+    the old one. They now start empty and show the current figure in grey: the first key typed
+    starts the new number, and an empty field means "the statement agrees".
+13. The open statement had a fixed height, so larger text was cut off, and its Check In button sat
+    inside another button, which can make a tap do the wrong thing. It now grows with its text and
+    the buttons are side by side.
+14. Amounts broke in the middle of a number at large text sizes ("$42,274.7" over "3"), on the
+    statement and in the income list. Amounts now stay on one line and shrink slightly if they must.
+15. On the iPhone SE the main button read "Make a Pay..." at the default text size, the bar being
+    a few points too narrow for that screen. The name now shrinks a little instead of being cut.
+16. At large text sizes the same button was cut on every iPhone. The top bar is one fixed row, so
+    its text now stops growing at the size where it still fits.
+17. At large text sizes, balances on the card strips ran into the "BALANCE" label above them. The
+    cards are drawn at a fixed size, so their text now stops growing at the size where it still fits.
+18. At the largest text sizes the income row squeezed the name to "Pay-ch...". It now stacks the
+    name, the rhythm and the amount.
+19. The income editor's list of next paydays said each date twice ("Fri, Oct 9 ... Oct 9, 2026").
+    It now says "Fri, Oct 9 ... In 3 days".
+20. Deleting a debt did not say it could be undone. The confirmation now does.
+21. The check-in button said "Balances" where it now means cards: "Check In 5 Cards".
+
+3.3 Found and fixed earlier on October 6, while building the features
+Listed here so the day's record is in one place.
+- Undoing an older entry on data from before October 4 applied every later payment a second
+  time. All of your own entries were of that kind. Rewritten, with a test.
+- The widget's eye button only changed the widget that was tapped. It now updates all of them.
+- In the PDF report, two column headings overlapped and one chart had odd tick values (58%, 29%).
+
+
+4. CHECKED AND FOUND CORRECT
+----------------------------
+Things looked at specifically, with nothing to fix.
+- The fast engine gives the same interest and payoff paydays as the day-by-day one (2.3).
+- No order of the seven debts that take extra payments costs less interest than Avalanche: all
+  5,040 orders, each run as a whole plan. They take about 4 seconds in the unoptimised test build.
+- Pay-later plans: one payment settles one installment, anything beyond it comes off the end of the
+  plan, and there is no nine-day wait. This matches Klarna's and Affirm's published terms.
+- Paydays: weekly and two-weekly keep their weekday; monthly keeps its day and handles the 29th
+  to 31st; two pay days that fall on the same date in a short month count once; several incomes
+  on one day are one payday with both amounts; a passed payday moves on by its own rhythm.
+- A whole paycheck split marked paid uses up that payday for the incomes behind it and no others.
+  Leaving one line unpaid leaves the payday where it is. Extra money never uses one up.
+- Undo then Redo returns the debts, entries and settings to exactly where they were (2.2).
+- Editing an entry's amount re-works what it counted as. A $35.00 minimum cut to $20.00 becomes a
+  partial payment, and the next payment then finishes the minimum instead of being all extra.
+- Moving an entry to another day changes the past: the balance history on the days between follows.
+- The one-time due-date repair only moves dates back, never forward; it leaves a debt with no
+  payments alone, and a debt added after its due day; and it does not run twice.
+- Arithmetic read off the screen: the statement (start, minus paid, plus charges, plus interest,
+  equals today) adds up to the cent before and after a check-in; the paycheck split totals the
+  paycheck less the buffer; card totals fall by exactly the card lines paid.
+- Files saved before October 6 open, with every date on the same calendar day, including a file
+  written in a time zone where midnight is a different day here.
+
+
+5. LEFT AS IT IS: THINGS TO KNOW OR DECIDE
+------------------------------------------
+None of these is a crash or a wrong sum.
+
+Two screens give different "interest" for the same month.
+- Insights, "September recap", says "Interest, about $324.69". The September statement says
+  "Interest recorded $169.47". Both are right by their own definition: the statement counts
+  interest actually recorded (the interest part of loan payments, and statement check-ins), while
+  Insights also estimates what the cards charged. Until check-ins are used every month the two
+  will differ, and someone will notice. Once they are, Insights should show the recorded figure.
+
+Decisions still open (also in preparation.txt and FUTURE_DEVELOPMENT.txt).
+- The debt-free month is the month of the last due date covered, which can be the month after the
+  last payment is made.
+- A minimum marked paid inside the nine-day wait is recorded as an extra payment.
+- One safety buffer is taken from every paycheck, whichever income it is.
+- A fixed monthly amount is paid on one day of the month.
+- Statement titles are in Snell Roundhand because iOS has no Apple Chancery.
+
+Limits of what the app knows.
+- Card balances still only move when something is recorded or checked in.
+- Credit utilization over time is measured against today's limits; past limits are not kept.
+- A debt deleted before October 6 has no record of when it was deleted. The history treats it as
+  gone from the day after its last entry.
+- Only payments and charges can be edited. Balance changes and check-ins can be undone and redone.
+- Undo keeps the last 15 actions. Each is a full copy of the data, kept in a second file.
+
+Text size.
+- The fixes in 3.2 cover the worst cases. Much of the app still uses fixed text sizes (card faces,
+  tile figures, the number pad), so larger text settings enlarge some things and not others.
+  Nothing overlaps or is cut at the size tested; the largest two sizes were not tested.
+
+Forward compatibility.
+- A file saved by a newer version of the app, opened by this one, is read as far as this one
+  understands it. Anything new in it would be lost on the next save. This can only happen by
+  restoring a newer backup into an older app, but there is no guard against it yet.
+
+
+6. NUMBERS
+----------
+  Source                11,266 lines of Swift in the app, the widget and the shared code
+  Tests                 2,072 lines, 67 tests
+  Since the one commit  25 files changed and 12 added, all uncommitted
+  Random actions        1,320 each time the suite runs, checked after every one
+  Engine comparisons    160 situations, fast against day by day
+  Payoff orders tried   5,040, none cheaper than Avalanche
+  Screens looked at     iPhone 17 and iPhone SE; light, dark and large text
+
+
+7. NOT VERIFIED
+---------------
+- Anything on a real iPhone.
+- Reminders actually firing.
+- The Lock Screen widget sizes.
+- CSV, PDF, Back Up Now and Restore through the share sheet and the file picker. What they
+  produce is tested; the dialogs were not driven by hand.
+- Fix 6 (the widget on a non-Gregorian calendar) and the comma-decimal fix from October 5: both
+  are reasoned from the code, not seen on a device set that way.
+- Fix 4 (what Reset erases): the code was read and the reset itself was done on screen, but the
+  folder was not inspected afterwards on a real install with an old copy in it.
+- Fix 10 (midnight while open): not waited for.
+- VoiceOver. Labels are in place on the new screens; nobody has listened to them.
+- The two largest accessibility text sizes, and an iPad running the iPhone app.
+- The speed of an optimised build. Timings above are from the unoptimised test build.
+- The privacy policy and the disclaimer have not been read by a lawyer.
+
+
+8. SUGGESTIONS, MOST IMPORTANT FIRST
+------------------------------------
+ 1. Commit this. The repository holds one commit from before October 6; everything since is
+    uncommitted. Commit the feature round and this check separately so either can be backed out.
+ 2. Open the app on your own data, accept the two documents, and look at one thing in particular:
+    the "Due dates corrected" notice for Chase. If November 9 is not right, change it under Edit.
+ 3. Run it on your iPhone through a full pay cycle and a month end. Most of section 7 clears itself
+    that way, and the monthly check-in can only really be judged with a real statement in hand.
+ 4. Make Insights use recorded interest once a month has check-ins, so the two screens agree (5).
+ 5. Add a monthly reminder for the statement check-in. The button is there; nothing prompts it.
+ 6. Guard against opening data from a newer version: refuse the backup with a clear message, and
+    for the app's own file, open it read-only and say "update APRFree" rather than saving over it.
+ 7. Give Dynamic Type one proper pass: decide which text scales and which is art, and test the two
+    largest sizes. The fixes here were for what broke, not a design.
+ 8. Add UI tests for the five flows done by hand in 2.6. They were checked today and will need
+    checking again after every change; a test would do it in a minute.
+ 9. Keep the random test and the day-by-day reference. When the engine changes, change the
+    reference only if the rules changed, never to make a difference go away.
+10. Let balance changes and check-ins be edited, not only undone.
+11. Record a credit limit's history, so utilization in the past is right after a limit changes.
+12. Before the App Store: everything in preparation.txt, and a lawyer's read of the two documents.
+13. Decide the design canvas: update it in a session of its own or retire it. It is out of date
+    (FUTURE_DEVELOPMENT.txt, section 9).

@@ -32,29 +32,29 @@ enum Persistence {
     }
 
     private static var fileURL: URL? { folder?.appendingPathComponent("data.json") }
+    private static var journalURL: URL? { folder?.appendingPathComponent("journal.json") }
 
     // MARK: Reading and writing a file's contents
 
-    /// The data as it is written to disk or to a backup: stamped with the time zone its dates are in.
+    /// The data as it is written to disk or to a backup. Every date in it is a calendar day
+    /// ("2026-10-09"), which reads the same in any time zone.
     static func contents(of data: AppData) throws -> Data {
-        var stamped = data
-        stamped.timeZone = Cal.zone.identifier
-        return try encoder.encode(stamped)
+        try encoder.encode(data)
     }
 
-    /// Reads saved data or a backup. Dates written in another time zone are moved to this one, so
-    /// each keeps its calendar day: a due date of Oct 9 saved in New York is still Oct 9 in Los Angeles.
+    /// Reads saved data or a backup, and brings anything written by an earlier version up to date.
+    ///
+    /// Older files hold moments in time rather than calendar days. Each of those is read as the day it
+    /// fell on in the time zone the file was written in. Files from October 5, 2026 name that zone;
+    /// earlier ones do not, and `zone` (here, by default) is used for them.
     static func read(_ raw: Data, zone: TimeZone = Cal.zone) throws -> AppData {
-        var data = try decoder.decode(AppData.self, from: raw)
-        if let id = data.timeZone, id != zone.identifier, let written = TimeZone(identifier: id) {
-            let moving = JSONDecoder()
-            moving.dateDecodingStrategy = .custom { decoder in
-                let text = try decoder.singleValueContainer().decode(String.self)
-                return Cal.rebase(try Date(text, strategy: .iso8601), from: written, to: zone)
-            }
-            data = try moving.decode(AppData.self, from: raw)
-        }
-        data.timeZone = nil
+        struct Stamp: Decodable { var timeZone: String? }
+        let written = (try? JSONDecoder().decode(Stamp.self, from: raw))?.timeZone.flatMap(TimeZone.init(identifier:))
+        let reader = JSONDecoder()
+        reader.dateDecodingStrategy = .iso8601
+        if let key = Day.legacyZone { reader.userInfo[key] = written ?? zone }
+        var data = try reader.decode(AppData.self, from: raw)
+        Migration.run(&data)
         data.sanitize()
         return data
     }
@@ -76,6 +76,57 @@ enum Persistence {
 
     static func save(_ data: AppData) {
         guard let url = fileURL, let raw = try? contents(of: data) else { return }
+        keepPreviousVersion(of: url)
         try? raw.write(to: url, options: [.atomic, .completeFileProtection])
     }
+
+    private struct Version: Decodable { var version: Int }
+    private static var checkedPrevious = false
+
+    /// Before this version first saves over a file an earlier version wrote, that file is copied
+    /// aside, so the upgrade can always be gone back on. Looked at once each time the app runs.
+    private static func keepPreviousVersion(of url: URL) {
+        guard !checkedPrevious else { return }
+        checkedPrevious = true
+        guard let aside = folder?.appendingPathComponent("data-before-v\(AppData.currentVersion).json"),
+              !FileManager.default.fileExists(atPath: aside.path), let old = try? Data(contentsOf: url),
+              let version = (try? JSONDecoder().decode(Version.self, from: old))?.version, version < AppData.currentVersion else { return }
+        try? old.write(to: aside, options: [.atomic, .completeFileProtection])
+    }
+
+    /// Removes everything kept beside the data file: the copy from before an upgrade and a file that
+    /// could not be read. Part of Reset Everything.
+    static func eraseSideFiles() {
+        guard let folder, let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
+        for name in names where name != "data.json" {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
+    // MARK: Undo history
+
+    static func loadJournal() -> Journal {
+        guard let url = journalURL, let raw = try? Data(contentsOf: url), let journal = try? decoder.decode(Journal.self, from: raw) else {
+            return Journal()
+        }
+        return journal
+    }
+
+    static func save(_ journal: Journal) {
+        guard let url = journalURL else { return }
+        if journal.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        } else if let raw = try? JSONEncoder.compact.encode(journal) {
+            try? raw.write(to: url, options: [.atomic, .completeFileProtection])
+        }
+    }
+}
+
+private extension JSONEncoder {
+    /// Dates the same way as the main file, without the pretty printing.
+    static let compact: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }()
 }

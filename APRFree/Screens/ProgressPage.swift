@@ -156,7 +156,7 @@ struct ProgressPage: View {
         if debts.isEmpty { return "Add one to see your date" }
         if debts.allSatisfy(\.isPaidOff) { return "Nothing left to pay here" }
         guard let free = store.free(in: scope) else {
-            return store.perPayday > 0.005 ? "Raise your payday amount" : "Add your payday amount"
+            return store.hasIncome ? "Raise what goes to debt" : "Add your income"
         }
         return "\(Fmt.plural(max(0, Cal.months(from: store.today, to: free)), "month")) to go"
     }
@@ -242,9 +242,9 @@ struct ProgressPage: View {
                 }
             }
             if noPlan {
-                TileNote(store.perPayday > 0.005
-                         ? "No payoff plan yet: your payday amount does not keep up with the interest. Raise it in Settings."
-                         : "No payoff plan yet. Add your payday amount in Settings to see one.")
+                TileNote(store.hasIncome
+                         ? "No payoff plan yet: what goes to debt does not keep up with the interest. Raise it under Income."
+                         : "No payoff plan yet. Add your income under Tools on the first page to see one.")
             }
         }
         .frame(minHeight: 252)

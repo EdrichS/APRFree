@@ -63,19 +63,15 @@ struct EngineTests {
     // MARK: The plan, against the independent model
 
     @Test func planMatchesTheIndependentModel() throws {
-        let avalanche = plan(.avalanche), snowball = plan(.snowball), highest = plan(.highestBalance), custom = plan(.custom)
+        let avalanche = plan(.avalanche), snowball = plan(.snowball), custom = plan(.custom)
         #expect(avalanche.totalInterest.cents == 2018.62)
         #expect(snowball.totalInterest.cents == 2025.76)
-        #expect(highest.totalInterest.cents == 3226.98)
         #expect(custom.totalInterest.cents == 2020.89)
         for result in [avalanche, snowball, custom] {
             #expect(result.finished)
             #expect(result.debtFree == Cal.date(2028, 4, 1))
             #expect(result.finalPayday == Cal.date(2028, 3, 24))
         }
-        #expect(highest.finished)
-        #expect(highest.debtFree == Cal.date(2028, 5, 1))
-        #expect(highest.finalPayday == Cal.date(2028, 4, 7))
         // Brief: Chase is gone in November 2026 and everything by April 2028.
         let chase = try debt("Chase")
         #expect(Fmt.monthYear(try #require(custom.payoff[chase.id])) == "Nov 2026")
@@ -91,11 +87,10 @@ struct EngineTests {
             #expect(custom.payoffPayday[try debt(name).id] == payday, "\(name)")
         }
         #expect(avalanche.payoffPayday[try debt("Capital One").id] == Cal.date(2026, 11, 20))
-        #expect(highest.payoffPayday[try debt("Capital One").id] == Cal.date(2027, 12, 17))
         #expect(snowball.payoffPayday[try debt("American Express").id] == Cal.date(2026, 10, 23))
     }
 
-    @Test func theFourStrategiesRankAsTheySay() throws {
+    @Test func theStrategiesRankAsTheySay() throws {
         let debts = demo.debts.filter { $0.kind != .payLater }
         func order(_ strategy: Strategy) -> [String] {
             PayoffEngine.priority(debts, strategy: strategy, customOrder: demo.settings.customOrder, on: today).map(\.title)
@@ -104,17 +99,12 @@ struct EngineTests {
         #expect(order(.avalanche) == ["Capital One", "Chase", "American Express", "Bank of America", "Auto loan", "Student loan", "Citi"])
         // Snowball: by balance, smallest first.
         #expect(order(.snowball) == ["American Express", "Chase", "Citi", "Capital One", "Bank of America", "Auto loan", "Student loan"])
-        // Highest Balance: by the dollars of interest charged in a month (balance x APR / 12).
-        #expect(order(.highestBalance) == ["Student loan", "Auto loan", "Bank of America", "Capital One", "Chase", "American Express", "Citi"])
-        #expect(PayoffEngine.priority(debts, strategy: .highestBalance, customOrder: [], on: today)
-            .map { $0.monthlyInterest(on: today).cents } == [84.79, 81.65, 59.50, 47.92, 27.90, 15.51, 0])
         #expect(order(.custom) == ["Chase", "Capital One", "Citi", "American Express", "Bank of America", "Auto loan", "Student loan"])
-        #expect(Strategy.allCases.map(\.title) == ["Avalanche", "Snowball", "Highest Balance", "Custom"])
+        #expect(Strategy.allCases.map(\.title) == ["Avalanche", "Snowball", "Custom"])
 
-        // A big balance at 20% against a small one at 30%: the two strategies disagree, as intended.
+        // A big balance at 20% against a small one at 30%: Avalanche goes by the rate, not the size.
         let big = Debt(kind: .card, provider: "Big", name: "", brand: "other", balance: 10000, apr: 20, minimum: 200, addedAt: today, startingBalance: 10000)
         let small = Debt(kind: .card, provider: "Small", name: "", brand: "other", balance: 500, apr: 30, minimum: 25, addedAt: today, startingBalance: 500)
-        #expect(PayoffEngine.priority([small, big], strategy: .highestBalance, customOrder: [], on: today).map(\.provider) == ["Big", "Small"])
         #expect(PayoffEngine.priority([big, small], strategy: .avalanche, customOrder: [], on: today).map(\.provider) == ["Small", "Big"])
 
         // The first extra dollars follow the strategy.
@@ -123,7 +113,11 @@ struct EngineTests {
             settings.strategy = strategy
             return PayoffEngine.split(amount: 1200, debts: demo.debts, settings: settings, today: today).lines.first(where: \.isExtra)?.title
         }
-        #expect(Strategy.allCases.map(firstExtra) == ["Capital One", "American Express", "Student loan", "Chase"])
+        #expect(Strategy.allCases.map(firstExtra) == ["Capital One", "American Express", "Chase"])
+
+        // "Highest Balance" was a fourth strategy once. Settings saved with it open as Avalanche.
+        #expect(try JSONDecoder().decode([Strategy].self, from: Data(#"["highestBalance","snowball","custom","avalanche"]"#.utf8))
+                == [.avalanche, .snowball, .custom, .avalanche])
     }
 
     @Test func anExtraDollarSavesAtTheRateOfTheDebtItLandsOn() throws {
@@ -136,11 +130,12 @@ struct EngineTests {
         #expect((big.monthlyInterest(on: today) - (big.balance - 100) * 20 / 1200).cents == 1.67)
         #expect((small.monthlyInterest(on: today) - (small.balance - 100) * 30 / 1200).cents == 2.50)
         // And over a whole payoff: the same $600.00 a month, two orders.
-        func cost(_ strategy: Strategy) -> PlanResult {
+        func cost(_ strategy: Strategy, _ order: [UUID] = []) -> PlanResult {
             PayoffEngine.simulate(PlanInput(debts: [big, small], today: today, firstPayday: Cal.date(2026, 10, 9), frequency: .monthly,
-                                            perPayday: 600, strategy: strategy, customOrder: [], promoMinimumOnly: true))
+                                            perPayday: 600, strategy: strategy, customOrder: order, promoMinimumOnly: true))
         }
-        let byRate = cost(.avalanche), byDollars = cost(.highestBalance)
+        // By rate, against the big balance first (the one charging more dollars of interest a month).
+        let byRate = cost(.avalanche), byDollars = cost(.custom, [big.id, small.id])
         #expect(byRate.finished && byDollars.finished)
         #expect(byRate.totalInterest < byDollars.totalInterest)
         #expect(byRate.debtFree! <= byDollars.debtFree!)
@@ -170,7 +165,7 @@ struct EngineTests {
             dearest = max(dearest, result.totalInterest)
         }
         #expect(cheaper == 0)
-        #expect(dearest > plan(.highestBalance).totalInterest)   // Highest Balance is costly, but not the worst possible order
+        #expect(dearest > best + 1000)                          // and the order matters: the worst one costs far more
         #expect(plan(.avalanche).totalInterest <= plan(.snowball).totalInterest)
     }
 
@@ -242,8 +237,8 @@ struct EngineTests {
 
     @Test func aCardsTotalCostFollowsTheStrategy() throws {
         let chase = try debt("Chase"), citi = try debt("Citi"), bofa = try debt("Bank of America")
-        // Interest still to come on the plan, strategy by strategy (independent model: 50.61, 27.35, 383.89, 14.77).
-        var expected: [Strategy: Double] = [.avalanche: 50.61, .snowball: 27.35, .highestBalance: 383.89, .custom: 14.77]
+        // Interest still to come on the plan, strategy by strategy (independent model: 50.61, 27.35, 14.77).
+        var expected: [Strategy: Double] = [.avalanche: 50.61, .snowball: 27.35, .custom: 14.77]
         for strategy in Strategy.allCases {
             var data = demo
             data.settings.strategy = strategy
@@ -353,7 +348,7 @@ struct EngineTests {
         // $412.00 scheduled: $81.65 interest, $330.35 principal. Then $295.01 extra straight onto principal.
         #expect(split.summary == "Auto loan drops to $13,574.64.")
         let store = AppStore(data: data, persists: false)
-        store.apply(split.lines, allPaid: true, nextPayday: split.nextPayday)
+        store.apply(split, paid: Set(split.lines.map(\.id)))
         #expect(store.debt(auto.id)?.balance == 13574.64)
         #expect(store.settings.nextPayday == Cal.date(2026, 10, 23))
         // Everything else fell by exactly what was paid to it.
@@ -430,13 +425,13 @@ struct EngineTests {
         #expect(snapshot.total.balance.cents == 42274.73)
         #expect(snapshot.cards.balance.cents == 8774.75)
         #expect(snapshot.loans.balance.cents == 32700.00)
-        #expect(snapshot.total.nextDue == Cal.date(2026, 10, 9))
+        #expect(snapshot.total.nextDue == Day(2026, 10, 9))
         #expect(snapshot.total.nextDueNames == "Chase, Citi")
         #expect(snapshot.cards.nextDueNames == "Chase, Citi")
-        #expect(snapshot.loans.nextDue == Cal.date(2026, 10, 15))
+        #expect(snapshot.loans.nextDue == Day(2026, 10, 15))
         #expect(snapshot.loans.nextDueNames == "Auto loan")
-        #expect(snapshot.cards.free == Cal.date(2027, 12, 9))
-        #expect(snapshot.loans.free == Cal.date(2028, 4, 1))
+        #expect(snapshot.cards.free == Day(2027, 12, 9))
+        #expect(snapshot.loans.free == Day(2028, 4, 1))
         #expect(snapshot.scope(.loans) == snapshot.loans)
     }
 
@@ -512,7 +507,7 @@ struct EngineTests {
         let store = AppStore(data: AppData(settings: settings), persists: false)
         store.refreshForToday()
         #expect(store.settings.nextPayday == Cal.date(2027, 2, 28))
-        #expect(store.upcomingPaydays(3) == [Cal.date(2027, 2, 28), Cal.date(2027, 3, 31), Cal.date(2027, 4, 30)])
+        #expect(store.upcomingPaydays(3).map(\.day.date) == [Cal.date(2027, 2, 28), Cal.date(2027, 3, 31), Cal.date(2027, 4, 30)])
         AppClock.override = Cal.date(2027, 3, 1)
         store.refreshForToday()
         #expect(store.settings.nextPayday == Cal.date(2027, 3, 31))
@@ -524,19 +519,32 @@ struct EngineTests {
         #expect(store.settings.nextPayday == Cal.date(2027, 5, 31))
         // Choosing a new date resets the day of the month.
         store.updateSettings { $0.setNextPayday(Cal.date(2027, 5, 15)) }
-        #expect(store.upcomingPaydays(3) == [Cal.date(2027, 5, 15), Cal.date(2027, 6, 15), Cal.date(2027, 7, 15)])
+        #expect(store.upcomingPaydays(3).map(\.day.date) == [Cal.date(2027, 5, 15), Cal.date(2027, 6, 15), Cal.date(2027, 7, 15)])
         AppClock.override = DemoData.today
     }
 
     @Test func removedPayScheduleStillLoads() throws {
-        // "Twice a month" is no longer offered. Data saved with it must still open.
-        var raw = String(decoding: try Persistence.encoder.encode(demo), as: UTF8.self)
-        #expect(raw.contains("\"payFrequency\" : \"biweekly\""))
-        raw = raw.replacingOccurrences(of: "\"payFrequency\" : \"biweekly\"", with: "\"payFrequency\" : \"semimonthly\"")
-        let loaded = try Persistence.decoder.decode(AppData.self, from: Data(raw.utf8))
-        #expect(loaded.settings.payFrequency == .biweekly)
-        #expect(loaded.debts.count == 9)
+        // "Twice a month" is no longer offered. Settings saved with it, in the single-schedule form
+        // from before there were several incomes, must still open: as one income, every two weeks.
+        let old = #"{"payFrequency":"semimonthly","nextPayday":"2026-10-09T04:00:00Z","payAmount":1200,"buffer":50,"strategy":"snowball","onboarded":true}"#
+        let reader = JSONDecoder()
+        reader.dateDecodingStrategy = .iso8601
+        let newYork: TimeZone = try #require(TimeZone(identifier: "America/New_York"))
+        reader.userInfo[try #require(Day.legacyZone)] = newYork
+        let loaded = try reader.decode(PlanSettings.self, from: Data(old.utf8))
+        #expect(loaded.incomes.count == 1)
+        #expect(loaded.incomes[0].frequency == .biweekly)
+        #expect(loaded.incomes[0].amount == 1200)
+        #expect(loaded.incomes[0].nextPayday == Cal.date(2026, 10, 9))
+        #expect(loaded.buffer == 50)
+        #expect(loaded.strategy == .snowball)
+        #expect(loaded.onboarded)
         #expect(PayFrequency.allCases.map(\.title) == ["Weekly", "Every 2 weeks", "Monthly"])
+        // A monthly schedule keeps the day of the month it remembered.
+        let monthly = #"{"payFrequency":"monthly","nextPayday":"2027-02-28T05:00:00Z","payAmount":900,"paydayAnchorDay":31}"#
+        let income = try #require(try reader.decode(PlanSettings.self, from: Data(monthly.utf8)).incomes.first)
+        #expect(income.payDays == [31])
+        #expect(income.paydays(from: Cal.date(2027, 2, 1), count: 3) == [Cal.date(2027, 2, 28), Cal.date(2027, 3, 31), Cal.date(2027, 4, 30)])
     }
 
     @Test func withNoIncomeThereIsNoPlanAndNothingRunsAway() throws {
@@ -588,7 +596,8 @@ struct EngineTests {
         #expect(store.settings.customOrder.isEmpty)
         #expect(store.total == 0)
         #expect(store.plan.finished)                       // nothing owed
-        #expect(store.widgetSnapshot == WidgetSnapshot(total: .empty, cards: .empty, loans: .empty, zone: Cal.zone.identifier))
+        #expect(store.widgetSnapshot == WidgetSnapshot(total: .empty, cards: .empty, loans: .empty))
+        #expect(store.undoLabel == nil)                    // and nothing left to undo back into
         // Setup can then add debts again from scratch.
         store.add(Debt.newLoan(type: .personal))
         #expect(store.data.debts.count == 1)
@@ -966,6 +975,12 @@ struct EngineTests {
         store.add(loan)
         #expect(store.activity.first?.label == "Personal loan added")
         store.delete(loan.id)
+        // The deletion is an entry too, and it keeps the debt so it can be brought back.
+        #expect(store.activity.count == countBefore + 6)
+        #expect(store.activity.first?.label == "Personal loan deleted")
+        #expect(store.debt(loan.id) == nil)
+        store.undo(try #require(store.activity.first).id)
+        #expect(store.debt(loan.id)?.balance == 900)
         #expect(store.activity.count == countBefore + 5)
     }
 
@@ -1049,47 +1064,62 @@ struct EngineTests {
         #expect(old.value(.cards) == nil)
     }
 
-    @Test func savedDatesKeepTheirDayInAnotherTimeZone() throws {
-        // A file written somewhere else, far enough away that midnight there is another day here.
+    @Test func datesAreSavedAsCalendarDays() throws {
+        // What is written is the day itself, with no time and no time zone.
+        let raw = String(decoding: try Persistence.contents(of: demo), as: UTF8.self)
+        #expect(raw.contains("\"paidThrough\" : \"2026-09-09\""))
+        #expect(raw.contains("\"nextPayday\" : \"2026-10-09\""))
+        #expect(raw.contains("\"date\" : \"2026-10-01\""))
+        #expect(!raw.contains("timeZone"))
+        #expect(try Persistence.read(Data(raw.utf8)) == demo)
+
+        // An older file holds moments in time. Each is read as the day it fell on where it was
+        // written. This one was written in Auckland or Los Angeles, whichever is not here, so its
+        // midnights are a different day here: read plainly, the due date would shift.
         let there = try #require(TimeZone(identifier: Cal.zone.identifier == "Pacific/Auckland" ? "America/Los_Angeles" : "Pacific/Auckland"))
         var away = Calendar(identifier: .gregorian)
         away.timeZone = there
-        func day(_ y: Int, _ m: Int, _ d: Int) throws -> Date { try #require(away.date(from: DateComponents(year: y, month: m, day: d))) }
-
-        var card = Debt(kind: .card, provider: "Chase", name: "", brand: "chase", balance: 1000, apr: 20, dueDay: 9, minimum: 35,
-                        addedAt: try day(2026, 9, 1), startingBalance: 1000)
-        card.paidThrough = try day(2026, 10, 9)
-        let plan = Debt(kind: .payLater, provider: "Klarna", name: "", brand: "klarna", balance: 100, apr: 0, minimum: 25,
-                        total: 100, installments: 4, paidInstallments: 0, every: .biweekly, nextDue: try day(2026, 10, 12),
-                        addedAt: try day(2026, 9, 1), startingBalance: 100)
-        var written = AppData(debts: [card, plan], settings: PlanSettings(payFrequency: .weekly, nextPayday: try day(2026, 10, 9)))
-        written.history = [BalancePoint(date: try day(2026, 10, 4), total: 1100, cards: 1000, loans: 0)]
-        written.timeZone = there.identifier
-
-        let read = try Persistence.read(try Persistence.encoder.encode(written))
-        #expect(read.timeZone == nil)
-        // Every date is the same calendar day here as it was there.
-        #expect(read.settings.nextPayday == Cal.date(2026, 10, 9))
-        #expect(read.settings.paydays(from: Cal.date(2026, 10, 10)).date(0) == Cal.date(2026, 10, 16))
+        func moment(_ y: Int, _ m: Int, _ d: Int) throws -> String {
+            try #require(away.date(from: DateComponents(year: y, month: m, day: d))).formatted(.iso8601)
+        }
+        let old = """
+        {"version":1,"timeZone":"\(there.identifier)","history":[{"date":"\(try moment(2026, 10, 4))","total":1100}],"payments":[],
+         "settings":{"payFrequency":"weekly","nextPayday":"\(try moment(2026, 10, 9))","payAmount":500},
+         "debts":[{"id":"11111111-1111-1111-1111-111111111111","kind":"card","provider":"Chase","name":"","brand":"chase","balance":1000,"apr":20,"dueDay":9,"minimum":35,
+                   "addedAt":"\(try moment(2026, 9, 1))","startingBalance":1000,"paidThrough":"\(try moment(2026, 10, 9))"},
+                  {"id":"22222222-2222-2222-2222-222222222222","kind":"payLater","provider":"Klarna","name":"","brand":"klarna","balance":100,"apr":0,"dueDay":1,"minimum":25,"total":100,
+                   "installments":4,"paidInstallments":0,"every":"biweekly","nextDue":"\(try moment(2026, 10, 12))",
+                   "addedAt":"\(try moment(2026, 9, 1))","startingBalance":100}]}
+        """
+        let read = try Persistence.read(Data(old.utf8))
+        #expect(read.version == AppData.currentVersion)
+        #expect(read.settings.incomes.first?.nextPayday == Cal.date(2026, 10, 9))
+        #expect(read.settings.incomes.first?.frequency == .weekly)
+        #expect(read.debts[0].addedAt == Cal.date(2026, 9, 1))
         #expect(read.debts[0].paidThrough == Cal.date(2026, 10, 9))
         #expect(read.debts[0].nextUnpaidDue() == Cal.date(2026, 11, 9))
         #expect(read.debts[1].nextDue == Cal.date(2026, 10, 12))
-        #expect(read.history[0].date == Cal.date(2026, 10, 4))
-        // Read plainly, without the move, the met due date lands on another day: the bug this prevents.
-        let plain = try Persistence.decoder.decode(AppData.self, from: try Persistence.encoder.encode(written))
-        #expect(Cal.startOfDay(try #require(plain.debts[0].paidThrough)) != Cal.date(2026, 10, 9))
+        // Saved again, it is in the new form, and reads back the same.
+        let saved = String(decoding: try Persistence.contents(of: read), as: UTF8.self)
+        #expect(saved.contains("\"paidThrough\" : \"2026-10-09\""))
+        #expect(try Persistence.read(Data(saved.utf8)).debts == read.debts)
 
-        // Files from this time zone, and older files with no time zone at all, are left exactly as they are.
-        #expect(try Persistence.read(try Persistence.encoder.encode(demo)) == demo)
-        let stamped = try Persistence.contents(of: demo)
-        #expect(try Persistence.decoder.decode(AppData.self, from: stamped).timeZone == Cal.zone.identifier)
-        #expect(try Persistence.read(stamped) == demo)
-
-        // A moved date keeps its time of day too.
-        let afternoon = try #require(away.date(from: DateComponents(year: 2026, month: 10, day: 9, hour: 15, minute: 30)))
-        let moved = Cal.rebase(afternoon, from: there, to: Cal.zone)
-        #expect(Cal.calendar.dateComponents([.year, .month, .day, .hour, .minute], from: moved)
-                == DateComponents(year: 2026, month: 10, day: 9, hour: 15, minute: 30))
+        // The day arithmetic itself, against the system calendar, across 80 years.
+        var day = Day(1990, 1, 1)
+        var date = Cal.date(1990, 1, 1)
+        for _ in 0..<1500 {
+            #expect(day.date == date)
+            #expect(Day(date) == day)
+            #expect(day.weekday == Cal.calendar.component(.weekday, from: date))
+            #expect(Day.next(dayOfMonth: 31, onOrAfter: day).date == Cal.nextDue(day: 31, onOrAfter: date))
+            #expect(day.adding(months: 1).date == Cal.addMonths(1, to: date))
+            day = day.adding(days: 19)
+            date = Cal.addDays(19, to: date)
+        }
+        #expect(Day(2028, 2, 31) == Day(2028, 2, 29))      // a day past the end of a month is its last day
+        #expect("\(Day(2026, 10, 9))" == "2026-10-09")
+        #expect(Day("2026-10-09") == Day(2026, 10, 9))
+        #expect(Day("10/9/2026") == nil)
     }
 
     @Test func aDamagedBackupIsBroughtBackIntoRange() throws {
@@ -1101,9 +1131,9 @@ struct EngineTests {
         let k = try #require(bad.debts.firstIndex { $0.kind == .payLater })
         bad.debts[k].installments = 2_000_000_000
         bad.debts[k].paidInstallments = -3
-        bad.settings.payAmount = -100
+        bad.settings.incomes[0].amount = -100
         bad.settings.buffer = 1e15
-        bad.settings.paydayAnchorDay = 40
+        bad.settings.fixedDay = 40
 
         let read = try Persistence.read(try Persistence.encoder.encode(bad))
         #expect(read.debts[0].balance == 0)
@@ -1113,9 +1143,9 @@ struct EngineTests {
         #expect(read.debts[k].installments == Limits.installments)
         #expect(read.debts[k].paidInstallments == 0)
         #expect(read.debts[k].remainingInstallmentDates.count == Limits.installments)
-        #expect(read.settings.payAmount == 0)
+        #expect(read.settings.incomes[0].amount == 0)
         #expect(read.settings.buffer == Limits.money)
-        #expect(read.settings.paydayAnchorDay == 31)
+        #expect(read.settings.fixedDay == 31)
         // The app still works out a plan from it without stalling.
         let store = AppStore(data: read, persists: false)
         _ = store.plan
@@ -1165,19 +1195,878 @@ struct EngineTests {
         #expect(csv.contains("\"'=HYPERLINK(\"\"x\"\")\""))
         #expect(csv.contains("Chase,adjustment,-12.00,,1228.50"))
 
-        // A long list of debts runs onto more pages of the summary instead of being cut off.
+        // The report opens as a PDF, and a long list of debts runs onto more pages instead of being cut off.
         var many = demo
-        for i in 0..<40 {
+        for i in 0..<60 {
             many.debts.append(Debt(kind: .card, provider: "Bank \(i)", name: "", brand: "other", balance: 100, apr: 20, dueDay: 5,
                                    minimum: 25, addedAt: today, startingBalance: 100))
         }
         func pages(_ data: AppData) throws -> Int {
-            let pdf = Exporter.pdf(data: data, plan: PayoffEngine.simulate(AppStore(data: data, persists: false).planInput()),
-                                   strategy: "Avalanche", today: today)
+            let pdf = Report.pdf(for: AppStore(data: data, persists: false))
             let provider = try #require(CGDataProvider(data: pdf as CFData))
             return try #require(CGPDFDocument(provider)).numberOfPages
         }
-        #expect(try pages(demo) == 1)
-        #expect(try pages(many) == 3)                      // 49 debts: 14 on the first page, 19 on each one after
+        let few = try pages(demo)
+        #expect(few >= 2)
+        #expect(try pages(many) > few)
+        // With nothing in it there is still a page, not a crash.
+        #expect(try pages(AppData.empty(today: today)) == 1)
     }
+
+    // MARK: Income
+
+    @Test func severalIncomesMakeOneCalendar() throws {
+        // A weekly side job on Fridays and a salary on the 1st and the 15th.
+        var settings = PlanSettings()
+        settings.buffer = 50
+        let side = Income(name: "Side job", amount: 200, frequency: .weekly, nextPayday: Cal.date(2026, 10, 9))
+        let salary = Income(name: "Salary", amount: 1500, frequency: .monthly, nextPayday: Cal.date(2026, 10, 15), monthDays: [1, 15])
+        settings.incomes = [side, salary]
+        let events = settings.schedule(today: today).events(from: Day(today), count: 7)
+        #expect(events.map(\.day) == [Day(2026, 10, 9), Day(2026, 10, 15), Day(2026, 10, 16), Day(2026, 10, 23), Day(2026, 10, 30),
+                                      Day(2026, 11, 1), Day(2026, 11, 6)])
+        #expect(events.map(\.gross) == [200, 1500, 200, 200, 200, 1500, 200])
+        #expect(events.map(\.net) == [150, 1450, 150, 150, 150, 1450, 150])      // the buffer comes out of each paycheck
+        #expect(events[1].lines == [salary.id])
+        #expect(salary.rhythm == "The 1st and 15th of every month")
+        #expect(side.rhythm == "Every Friday")
+        // Two incomes landing on the same day are one payday with both amounts.
+        settings.incomes[0].nextPayday = Cal.date(2026, 10, 15)
+        let together = try #require(settings.schedule(today: today).events(from: Day(today), count: 1).first)
+        #expect(together.gross == 1700 && together.net == 1600 && together.lines.count == 2)
+        // The 30th and the 31st are one payday in February, not two.
+        let ends = Income(amount: 100, frequency: .monthly, nextPayday: Cal.date(2027, 1, 30), monthDays: [30, 31])
+        #expect(ends.paydays(from: Cal.date(2027, 1, 1), count: 4) == [Cal.date(2027, 1, 30), Cal.date(2027, 1, 31), Cal.date(2027, 2, 28), Cal.date(2027, 3, 30)])
+
+        // More income clears the debt sooner, and the plan uses every payday.
+        var data = demo
+        let one = AppStore(data: data, persists: false).plan
+        data.settings.incomes.append(Income(name: "Side job", amount: 250, frequency: .weekly, nextPayday: Cal.date(2026, 10, 9)))
+        let store = AppStore(data: data, persists: false)
+        let two = store.plan
+        #expect(one.finished && two.finished)
+        let soonerEnd = try #require(two.debtFree), laterEnd = try #require(one.debtFree)
+        #expect(soonerEnd < laterEnd)
+        #expect(two.totalInterest < one.totalInterest)
+        #expect(store.suggestedPayment == 1450)            // Oct 9: the paycheck and the side job together
+        let aMonth: Double = 1150 * 26.0 / 12 + 200 * 52.0 / 12
+        #expect(store.monthlyForDebt.cents == aMonth.cents)
+
+        // Marking a whole split paid uses up that payday for the incomes behind it, and only those.
+        let split = PayoffEngine.split(amount: 1450, debts: data.debts, settings: data.settings, today: today)
+        #expect(split.bufferKept == 50)
+        #expect(split.nextPayday == Cal.date(2026, 10, 16))
+        store.apply(split, paid: Set(split.lines.map(\.id)))
+        #expect(store.settings.incomes.map(\.nextPayday) == [Cal.date(2026, 10, 23), Cal.date(2026, 10, 16)])
+        #expect(store.undoLabel == "Payday split")
+        // Leaving a line unpaid leaves the payday where it is.
+        let part = PayoffEngine.split(amount: 400, debts: store.data.debts, settings: store.settings, today: today)
+        #expect(part.lines.count > 1 && part.payday == Cal.date(2026, 10, 16))
+        store.apply(part, paid: Set(part.lines.prefix(1).map(\.id)))
+        #expect(store.settings.incomes.map(\.nextPayday) == [Cal.date(2026, 10, 23), Cal.date(2026, 10, 16)])
+    }
+
+    @Test func aFixedAmountCanStandInForPaydays() throws {
+        var data = demo
+        data.settings.useFixedAmount = true
+        data.settings.fixedAmount = 2000
+        data.settings.fixedDay = 20
+        let store = AppStore(data: data, persists: false)
+        #expect(store.upcomingPaydays(3).map(\.day) == [Day(2026, 10, 20), Day(2026, 11, 20), Day(2026, 12, 20)])
+        #expect(store.upcomingPaydays(1).first?.net == 2000)   // all of it: no buffer is taken from a fixed amount
+        #expect(store.suggestedPayment == 2000)
+        #expect(store.plan.finished)
+        let split = PayoffEngine.split(amount: 2000, debts: data.debts, settings: data.settings, today: today)
+        #expect(split.bufferKept == 0)
+        #expect(split.total == 2000)
+        #expect(split.payday == Cal.date(2026, 10, 20) && split.nextPayday == Cal.date(2026, 11, 20))
+        store.apply(split, paid: Set(split.lines.map(\.id)))
+        #expect(store.upcomingPaydays(1).first?.day == Day(2026, 11, 20))   // this month's amount is used
+        #expect(store.settings.incomes.first?.nextPayday == Cal.date(2026, 10, 9))   // the paydays are kept, untouched
+        // With no income at all there are no paydays, and Make a Payment covers the next two weeks.
+        var none = demo.settings
+        none.incomes = []
+        let bare = PayoffEngine.split(amount: 300, debts: demo.debts, settings: none, today: today)
+        #expect(bare.payday == today && bare.nextPayday == Cal.date(2026, 10, 18))
+        #expect(bare.incomes.isEmpty)
+    }
+
+    @Test func extraMoneyUsesNoPayday() throws {
+        let store = AppStore(data: demo, persists: false)
+        let extra = PayoffEngine.extraSplit(amount: 500, debts: demo.debts, settings: demo.settings, today: today)
+        // Nothing is held back and nothing is overdue, so all of it goes to the first debt in the strategy.
+        #expect(extra.isExtraMoney && extra.bufferKept == 0)
+        let extraLines = extra.lines.map { "\($0.title) \($0.amount.usd)" }
+        #expect(extraLines == ["Chase $500.00"])
+        #expect(extra.lines.allSatisfy { $0.isExtra })
+        store.apply(extra, paid: Set(extra.lines.map(\.id)))
+        let chaseID = try debt("Chase").id
+        #expect(store.debt(chaseID)?.balance == 740.50)
+        #expect(store.settings.incomes.first?.nextPayday == Cal.date(2026, 10, 9))   // the paycheck is still to come
+        #expect(store.undoLabel == "Extra money")
+        // More than the first debt owes spills to the next.
+        let large = PayoffEngine.extraSplit(amount: 2000, debts: demo.debts, settings: demo.settings, today: today)
+        #expect(large.lines.map(\.title) == ["Chase", "Capital One"])
+        #expect(large.total == 2000)
+        // Something overdue comes first, because that is where late fees come from.
+        var late = demo
+        let b = try #require(late.debts.firstIndex { $0.title == "Bank of America" })
+        late.debts[b].paidThrough = Cal.date(2026, 8, 22)   // September's minimum was missed
+        let rescue = PayoffEngine.extraSplit(amount: 100, debts: late.debts, settings: late.settings, today: today)
+        let rescueLines = rescue.lines.map { "\($0.title) \($0.amount.usd) \($0.isExtra)" }
+        #expect(rescueLines == ["Bank of America $85.00 false", "Chase $15.00 true"])
+    }
+
+    // MARK: Undo, redo and editing
+
+    @Test func theLastActionCanBeUndoneAndRedone() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase")
+        #expect(store.undoLabel == nil && store.redoLabel == nil)
+
+        // Deleting a debt, the thing most worth being able to take back.
+        store.delete(chase.id)
+        #expect(store.debt(chase.id) == nil)
+        #expect(store.undoLabel == "Delete Chase")
+        store.undoLast()
+        #expect(store.debt(chase.id) == chase)
+        #expect(store.data.debts == demo.debts && store.data.payments == demo.payments && store.settings == demo.settings)
+        #expect(store.undoLabel == nil && store.redoLabel == "Delete Chase")
+        store.redo()
+        #expect(store.debt(chase.id) == nil)
+        #expect(store.redoLabel == nil)
+        store.undoLast()
+
+        // Several steps come back in reverse order, and a new action ends the chance to redo.
+        store.pay(chase.id, amount: 35)
+        store.charge(chase.id, amount: 20)
+        store.updateSettings("Change strategy") { $0.strategy = .snowball }
+        #expect(store.undoLabel == "Change strategy")
+        store.undoLast()
+        #expect(store.settings.strategy == .custom)
+        #expect(store.undoLabel == "Chase charge")
+        store.undoLast()
+        #expect(store.debt(chase.id)?.balance == 1205.50)
+        store.pay(chase.id, amount: 10)
+        #expect(store.redoLabel == nil)
+        // A change that changes nothing is not a step, and neither is housekeeping without a label.
+        let steps = store.journal.undo.count
+        store.updateSettings("Change strategy") { $0.strategy = .custom }
+        store.updateSettings { $0.remindPaydays.toggle() }
+        #expect(store.journal.undo.count == steps)
+        // Only the last few steps are kept.
+        for _ in 0..<40 { store.charge(chase.id, amount: 1) }
+        #expect(store.journal.undo.count == Journal.limit)
+        // Past balances follow: history is worked out from the entries, so it has no entry for what was undone.
+        let before = store.data.history
+        store.undoLast()
+        #expect(store.data.history != before)
+        #expect(store.data.history.last?.total == store.total.cents)
+    }
+
+    @Test func anEntryCanBeEditedInPlace() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase")
+        store.pay(chase.id, amount: 35)                    // a minimum, meeting October 9
+        store.pay(chase.id, amount: 100)                   // then an extra
+        var mine = store.activity(for: chase.id)
+        #expect(mine.prefix(2).map(\.kind) == [.extra, .minimum])
+        #expect(store.debt(chase.id)?.balance == 1105.50)
+
+        // Change the first payment from $35.00 to $20.00: it no longer meets the minimum, so it becomes
+        // a partial payment, and the next one finishes the minimum instead of being all extra.
+        store.edit(mine[1].id, amount: 20, date: today)
+        mine = store.activity(for: chase.id)
+        #expect(mine.prefix(2).map(\.kind) == [.payment, .partial])
+        #expect(mine.prefix(2).map(\.amount) == [100, 20])
+        #expect(mine.prefix(2).map(\.balanceAfter) == [1120.50, 1220.50])
+        #expect(store.debt(chase.id)?.balance == 1120.50)
+        #expect(store.debt(chase.id)?.nextUnpaidDue() == Cal.date(2026, 11, 9))
+        #expect(store.undoLabel == "Edit Chase minimum paid")
+        store.undoLast()
+        #expect(store.debt(chase.id)?.balance == 1105.50)
+
+        // Move an old payment to another day: September's minimum, paid on the 9th, to the 2nd.
+        let september = try #require(store.activity(for: chase.id).first { $0.date == Cal.date(2026, 9, 9) })
+        let entries = store.activity.count
+        store.edit(september.id, amount: 35, date: Cal.date(2026, 9, 2))
+        #expect(store.activity.count == entries)
+        #expect(store.activity(for: chase.id).contains { $0.date == Cal.date(2026, 9, 2) && $0.amount == 35 })
+        #expect(store.debt(chase.id)?.balance == 1105.50)  // the same money, on a different day
+        // The past changed with it: the balance was already lower on September 5.
+        let track = try #require(History.tracks(debts: store.data.debts, payments: store.data.payments, today: today).first { $0.id == chase.id })
+        #expect(track.balance(on: Cal.date(2026, 9, 5)) == 1240.50)
+        #expect(track.balance(on: Cal.date(2026, 9, 1)) == 1275.50)
+        // Things that are not payments or charges cannot be edited, and say so.
+        let added = try #require(store.activity(for: chase.id).last)
+        #expect(store.editBlocker(added) != nil)
+        // A day in the future, or before the debt existed, is brought back in range.
+        store.edit(september.id, amount: 35, date: Cal.date(2031, 1, 1))
+        #expect(store.activity(for: chase.id).allSatisfy { $0.date <= today })
+    }
+
+    @Test func entriesFromBeforeSnapshotsWereKeptUndoCleanly() throws {
+        // The oldest data has entries with no record of the state before them or the balance after.
+        var data = demo
+        for i in data.payments.indices {
+            data.payments[i].before = nil
+            data.payments[i].balanceAfter = nil
+        }
+        data.version = 1
+        Migration.run(&data)
+        #expect(data.version == AppData.currentVersion)
+        // The balances each entry left are worked back out, and match what the demo recorded: to the cent
+        // for cards and pay-later plans, and within a cent for loans, whose interest was itself rounded.
+        for (worked, recorded) in zip(data.payments, demo.payments) {
+            let gap = abs((worked.balanceAfter ?? -1) - (recorded.balanceAfter ?? -2))
+            #expect(gap < (worked.debtKind == .loan ? 0.011 : 0.001), "\(recorded.label) \(Fmt.isoDay(recorded.date))")
+        }
+        #expect(data.payments.allSatisfy { $0.debtKind != nil })
+
+        // Undoing an old entry takes its amount back once, however many entries came after it.
+        let store = AppStore(data: data, persists: false)
+        let chase = try debt("Chase")
+        let may = try #require(store.activity(for: chase.id).first { $0.date == Cal.date(2026, 5, 9) })
+        store.undo(may.id)
+        #expect(store.debt(chase.id)?.balance == 1275.50)
+        #expect(store.activity(for: chase.id).count == 6)
+        #expect(store.activity(for: chase.id).first?.balanceAfter == 1275.50)
+        // And the history drawn from the entries agrees with the totals now.
+        #expect(store.data.history.last?.total == store.total.cents)
+        #expect(store.data.history.last?.cards == store.total(of: .card).cents)
+    }
+
+    @Test func dueDatesPushedTooFarAreRepairedOnce() throws {
+        // An earlier version moved the due date on with every payment. Three payments in one week
+        // pushed this card's date three months ahead.
+        func card(_ title: String, due: Int, through: Date?, added: Date) -> Debt {
+            Debt(kind: .card, provider: title, name: "", brand: "other", balance: 500, apr: 20, dueDay: due, minimum: 25,
+                 addedAt: added, startingBalance: 600, paidThrough: through)
+        }
+        let pushed = card("Pushed", due: 9, through: Cal.date(2027, 1, 9), added: Cal.date(2026, 1, 1))
+        let fine = card("Fine", due: 12, through: Cal.date(2026, 9, 12), added: Cal.date(2026, 1, 1))
+        let fresh = card("Fresh", due: 1, through: Cal.date(2026, 11, 1), added: Cal.date(2026, 10, 4))   // added after this month's due day
+        let quiet = card("Quiet", due: 20, through: Cal.date(2027, 3, 20), added: Cal.date(2026, 1, 1))   // no payments recorded at all
+        func paid(_ debt: Debt, _ date: Date, _ kind: PaymentRecord.Kind = .minimum) -> PaymentRecord {
+            PaymentRecord(debtID: debt.id, title: debt.title, date: date, amount: 25, kind: kind)
+        }
+        var data = AppData(version: 1, debts: [pushed, fine, fresh, quiet],
+                           payments: [paid(pushed, Cal.date(2026, 9, 28)), paid(pushed, Cal.date(2026, 10, 1), .extra), paid(pushed, Cal.date(2026, 10, 4), .extra),
+                                      paid(fine, Cal.date(2026, 9, 12)), paid(fresh, Cal.date(2026, 10, 4))],
+                           settings: PlanSettings())
+        Migration.run(&data)
+        // The latest payment, October 4, could have met October 9 at the furthest: so next is November 9.
+        #expect(data.debts[0].paidThrough == Cal.date(2026, 10, 9))
+        #expect(data.debts[0].nextUnpaidDue() == Cal.date(2026, 11, 9))
+        // Dates the rules allow are left exactly as they were.
+        #expect(data.debts[1].paidThrough == Cal.date(2026, 9, 12))
+        #expect(data.debts[2].paidThrough == Cal.date(2026, 11, 1))
+        #expect(data.debts[3].paidThrough == Cal.date(2027, 3, 20))
+        // The user is told what moved, once.
+        #expect(data.settings.notices == ["Pushed: next due date moved from Feb 9, 2027 back to Nov 9, 2026."])
+        let store = AppStore(data: data, persists: false)
+        store.dismissNotices()
+        #expect(store.settings.notices.isEmpty)
+        // It does not run again on data that is already up to date.
+        var again = store.data
+        again.debts[0].paidThrough = Cal.date(2027, 1, 9)
+        Migration.run(&again)
+        #expect(again.debts[0].paidThrough == Cal.date(2027, 1, 9))
+    }
+
+    // MARK: Statements and utilization
+
+    @Test func statementCheckInBringsABalanceUpToDate() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase"), auto = try debt("Auto loan")
+        #expect(store.awaitingCheckIn.count == 5)          // the five cards; loans work out their own interest
+        #expect(store.checkInCandidates.count == 7)        // loans can still be checked in; pay-later plans have no statements
+        // Chase's statement says $1,268.40: $27.90 of interest the app had not seen.
+        store.checkIn([.init(debtID: chase.id, balance: 1268.40, minimum: 40, interest: 27.90),
+                       .init(debtID: auto.id, balance: 14200, minimum: nil, interest: nil)])
+        let after = try #require(store.debt(chase.id))
+        #expect(after.balance == 1268.40)
+        #expect(after.minimum == 40)
+        #expect(after.statementThrough == today)
+        #expect(after.startingBalance == chase.startingBalance + 27.90)   // interest is new debt, not money un-paid
+        #expect(store.paidSoFar(in: .cards).cents == AppStore(data: demo, persists: false).paidSoFar(in: .cards).cents)
+        let entry = try #require(store.activity(for: chase.id).first)
+        #expect(entry.kind == .statement && entry.amount == 27.90 && entry.interest == 27.90 && entry.balanceAfter == 1268.40)
+        #expect(entry.signedAmount == "+$27.90")
+        #expect(store.activity(for: auto.id).first?.amount == 0)          // unchanged, but checked
+        #expect(store.awaitingCheckIn.count == 4)
+        // The whole check-in is one step.
+        #expect(store.undoLabel == "Statement check-in")
+        store.undoLast()
+        #expect(store.debt(chase.id) == chase)
+        #expect(store.awaitingCheckIn.count == 5)
+        store.redo()
+        // One entry can be taken back on its own.
+        store.undo(try #require(store.activity(for: chase.id).first).id)
+        #expect(store.debt(chase.id)?.balance == 1240.50)
+        #expect(store.debt(chase.id)?.statementThrough == nil)
+
+        // A statement for every month since the first entry, oldest first.
+        let statements = store.statements
+        let months = statements.map { Fmt.monthNameYear($0.month) }
+        #expect(months == ["March 2026", "April 2026", "May 2026", "June 2026", "July 2026", "August 2026", "September 2026", "October 2026"])
+        let september = try #require(statements.first { $0.month == Cal.date(2026, 9, 1) })
+        // Five card minimums, both loan payments, Affirm's installment and Klarna's first.
+        #expect(september.paid == (35 + 58 + 85 + 40 + 29 + 412 + 210 + 175 + 49.99).cents)
+        #expect(september.payments.count == 9)
+        #expect(september.interest > 0)                    // the interest part of the two loan payments
+        #expect(!september.isCurrent)
+        // Each month starts where the last one ended, and the newest ends on today's total.
+        for (earlier, later) in zip(statements, statements.dropFirst()) { #expect(earlier.closing == later.opening) }
+        #expect(statements.last?.closing == store.total.cents)
+        #expect(statements.last?.isCurrent == true)
+        #expect(statements.first?.opening == 0)
+    }
+
+    @Test func utilizationAndTheDayEachCardDropsUnderThirtyPercent() throws {
+        let store = AppStore(data: demo, persists: false)
+        #expect(store.limitedCards.count == 5)
+        // $8,774.75 owed against $19,500.00 of limits.
+        #expect(try #require(store.utilization) == 8774.75 / 19500)
+        #expect(store.utilizationHistory.last?.total == 8774.75 / 19500)
+        #expect(store.utilizationHistory.first?.date == Cal.date(2026, 3, 31))
+        let plan = store.utilizationPlan
+        #expect(plan.first?.total == 8774.75 / 19500)
+        #expect(plan.last?.total == 0)
+        #expect(zip(plan, plan.dropFirst()).allSatisfy { $1.total <= $0.total + 1e-9 })   // only ever down, with no new charges
+        // Chase is at 41% of $3,000.00. It drops under 30% ($900.00) on the payday its balance first is.
+        let chase = try debt("Chase")
+        let day = try #require(store.under30Date(for: chase))
+        let line = try #require(store.plan.balances[chase.id])
+        let index = try #require(store.plan.series.firstIndex { $0.date == day })
+        #expect(line[index] < 900 && line[index - 1] >= 900)
+        #expect(day == Cal.date(2026, 10, 23))
+        // A card already under 30% says so with today; one with no limit has no answer.
+        var data = demo
+        let a = try #require(data.debts.firstIndex { $0.title == "American Express" })
+        data.debts[a].balance = 500                        // 20% of $2,500.00
+        data.debts[0].creditLimit = nil
+        let other = AppStore(data: data, persists: false)
+        #expect(other.under30Date(for: data.debts[a]) == today)
+        #expect(other.under30Date(for: data.debts[0]) == nil)
+        #expect(other.limitedCards.count == 4)
+    }
+
+    // MARK: Speed and agreement
+
+    @Test func everyOrderOfSevenDebtsRunsQuicklyAndNoneBeatsAvalanche() throws {
+        // All 5,040 ways to order the seven debts that take extra payments, each run as a whole plan.
+        let ids = try ["Chase", "Capital One", "Bank of America", "American Express", "Auto loan", "Student loan", "Citi"].map { try debt($0).id }
+        let rest = try ["Klarna", "Affirm"].map { try debt($0).id }
+        func permutations(_ items: [UUID]) -> [[UUID]] {
+            guard items.count > 1 else { return [items] }
+            return items.indices.flatMap { i -> [[UUID]] in
+                var others = items
+                let head = others.remove(at: i)
+                return permutations(others).map { [head] + $0 }
+            }
+        }
+        let orders = permutations(ids)
+        #expect(orders.count == 5040)
+        func input(_ strategy: Strategy, _ order: [UUID]) -> PlanInput {
+            PlanInput(debts: demo.debts, today: today, firstPayday: demo.settings.nextPayday, frequency: .biweekly, perPayday: 1150,
+                      strategy: strategy, customOrder: order, promoMinimumOnly: false, totalsOnly: true)
+        }
+        let best = PayoffEngine.simulate(input(.avalanche, [])).totalInterest
+        var cheaper = 0
+        let took = ContinuousClock().measure {
+            for order in orders where PayoffEngine.simulate(input(.custom, order + rest)).totalInterest < best - 0.005 { cheaper += 1 }
+        }
+        #expect(cheaper == 0)
+        print("5,040 plans in \(took)")
+        #expect(took < .seconds(20))                       // an unoptimised test build; a release build is many times faster
+        // The plan's own day arithmetic gives the same due dates and installment dates as the rest of the app.
+        for d in demo.debts {
+            let alone = PayoffEngine.simulate(PlanInput(debts: [d], today: today, firstPayday: today, frequency: .weekly, perPayday: 1,
+                                                        strategy: .avalanche, customOrder: [], promoMinimumOnly: true, oneTime: 100_000))
+            let covered = d.kind == .payLater ? d.remainingInstallmentDates.last : d.nextUnpaidDue().map { Cal.nextDue(day: d.dueDay, onOrAfter: max($0, today)) }
+            #expect(alone.payoff[d.id] == covered.map { max($0, today) }, "\(d.title)")
+        }
+        // Leaving out the detail does not change the answer.
+        var full = input(.avalanche, [])
+        full.totalsOnly = false
+        let detailed = PayoffEngine.simulate(full)
+        #expect(detailed.totalInterest == best)
+        #expect(detailed.debtFree == PayoffEngine.simulate(input(.avalanche, [])).debtFree)
+        #expect(!detailed.series.isEmpty && PayoffEngine.simulate(input(.avalanche, [])).series.isEmpty)
+    }
+
+    @Test func interestInOneStepMatchesInterestDayByDay() throws {
+        // The plan works out a stretch of days in one step. Check that against adding it up a day at
+        // a time, the way it used to be done: a card compounds daily, a loan charges simple interest.
+        let card = Debt(kind: .card, provider: "Card", name: "", brand: "other", balance: 5000, apr: 24.99, dueDay: 28, minimum: 100,
+                        addedAt: today, startingBalance: 5000, paidThrough: Cal.date(2026, 9, 28))
+        let loan = Debt(kind: .loan, provider: "Loan", name: "", brand: "other", balance: 8000, apr: 7.5, dueDay: 28, minimum: 300,
+                        loanType: .personal, addedAt: today, startingBalance: 8000, paidThrough: today)
+        // One payday 40 days out, big enough to clear both, so the only interest is those 40 days.
+        func run(_ debt: Debt) -> Double {
+            PayoffEngine.simulate(PlanInput(debts: [debt], today: today, firstPayday: Cal.addDays(40, to: today), frequency: .monthly,
+                                            perPayday: 20000, strategy: .avalanche, customOrder: [], promoMinimumOnly: true)).totalInterest
+        }
+        var balance = 5000.0
+        for _ in 0..<40 { balance += balance * 24.99 / 36500 }
+        #expect(abs(run(card) - (balance - 5000)) < 1e-9)
+        #expect(abs(run(loan) - 8000 * 7.5 / 36500 * 40) < 1e-9)
+        // A promo that ends partway: 0% for the first 15 days, the regular rate for the other 25.
+        var promo = card
+        promo.promoAPR = 0
+        promo.promoEnd = Cal.addDays(15, to: today)
+        balance = 5000
+        for _ in 0..<25 { balance += balance * 24.99 / 36500 }
+        #expect(abs(run(promo) - (balance - 5000)) < 1e-9)
+    }
+
+    // MARK: Checks from the October 6 review
+
+    @Test func undoLeavesTheIPhonesOwnSettingsAlone() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase")
+        store.pay(chase.id, amount: 35)
+        // Things that are not part of the plan, changed after the payment.
+        store.updateSettings {
+            $0.remindDueDates = false
+            $0.lastBackup = Cal.date(2026, 10, 4)
+            $0.notices = ["A note"]
+        }
+        store.undoLast()
+        #expect(store.debt(chase.id)?.balance == 1240.50)  // the payment is taken back
+        #expect(store.settings.remindDueDates == false)    // the switch is not
+        #expect(store.settings.lastBackup == Cal.date(2026, 10, 4))
+        #expect(store.settings.notices == ["A note"])
+        #expect(store.settings.hasAcceptedLegal)
+        store.redo()
+        #expect(store.settings.remindDueDates == false)
+        #expect(store.debt(chase.id)?.balance == 1205.50)
+
+        // A run of the same small change is one step, undone back to where it started.
+        store.updateSettings("Change safety buffer", merging: true) { $0.buffer = 7 }
+        store.updateSettings("Change safety buffer", merging: true) { $0.buffer = 75 }
+        store.updateSettings("Change safety buffer", merging: true) { $0.buffer = 80 }
+        #expect(store.undoLabel == "Change safety buffer")
+        let steps = store.journal.undo.count
+        store.undoLast()
+        #expect(store.settings.buffer == 50)
+        #expect(store.journal.undo.count == steps - 1)
+
+        // A payday that passed while a step was waiting is moved on after the undo, not brought back.
+        store.pay(chase.id, amount: 10)
+        AppClock.override = Cal.date(2026, 10, 12)
+        store.refreshForToday()
+        #expect(store.settings.incomes.first?.nextPayday == Cal.date(2026, 10, 23))
+        store.undoLast()
+        #expect(store.settings.incomes.first?.nextPayday == Cal.date(2026, 10, 23))
+        AppClock.override = DemoData.today
+    }
+
+    @Test func restoringABackupKeepsWhatWasAccepted() throws {
+        let store = AppStore(data: demo, persists: false)
+        var backup = demo
+        backup.settings.acceptedPrivacy = nil              // a backup from before the policy existed
+        backup.settings.acceptedDisclaimer = nil
+        backup.settings.acceptedLegalVersion = nil
+        backup.settings.onboarded = false
+        backup.debts.removeLast()
+        store.restore(backup)
+        #expect(store.data.debts.count == 8)
+        #expect(store.settings.hasAcceptedLegal)           // not asked again on this iPhone
+        #expect(store.settings.onboarded)
+        #expect(store.undoLabel == "Restore backup")
+        store.undoLast()
+        #expect(store.data.debts.count == 9)
+        // On an iPhone that has accepted nothing, a backup's own acceptance is what counts.
+        var fresh = AppData.empty(today: today)
+        fresh.settings.onboarded = true
+        let other = AppStore(data: fresh, persists: false)
+        other.restore(backup)
+        #expect(!other.settings.hasAcceptedLegal)
+        other.restore(demo)
+        #expect(other.settings.hasAcceptedLegal)
+    }
+
+    /// A small repeatable source of random numbers, so a failure can be run again exactly.
+    private struct Dice: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+        mutating func int(_ n: Int) -> Int { Int(next() % UInt64(max(1, n))) }
+        mutating func money(_ most: Double) -> Double { (Double(next() % 1_000_000) / 1_000_000 * most).cents }
+        mutating func pick<T>(_ items: [T]) -> T? { items.isEmpty ? nil : items[int(items.count)] }
+    }
+
+
+    /// What must be true of the data whatever the user has just done.
+    private func consistent(_ store: AppStore, _ place: String, thorough: Bool = true) throws {
+        let data = store.data
+        for d in data.debts {
+            #expect(d.balance >= 0 && d.balance.isFinite && d.balance == d.balance.cents, "\(place): \(d.title) balance \(d.balance)")
+            #expect(d.isPaidOff || d.paidOffAt == nil, "\(place): \(d.title) has a paid-off date but owes \(d.balance)")
+            #expect((d.paidTowardDue ?? 1) > 0, "\(place): \(d.title) part-paid nothing")
+            #expect((d.paidInstallments ?? 0) <= (d.installments ?? 0), "\(place): \(d.title) installments")
+            if let last = data.payments.last(where: { $0.debtID == d.id }) {
+                #expect(abs((last.balanceAfter ?? d.balance) - d.balance) < 0.006, "\(place): \(d.title) last entry left \(last.balanceAfter ?? -1), balance \(d.balance)")
+            }
+        }
+        #expect(data.payments.allSatisfy { $0.amount.isFinite && ($0.isSigned || $0.amount >= 0) }, "\(place): an entry amount")
+        // The history drawn from the entries ends today, on today's totals, and never runs backwards.
+        #expect(data.debts.isEmpty && data.payments.isEmpty || data.history.last?.date == store.today, "\(place): history ends today")
+        #expect((data.history.last?.total ?? 0) == store.total.cents || data.debts.isEmpty, "\(place): history total")
+        #expect(zip(data.history, data.history.dropFirst()).allSatisfy { $0.date < $1.date }, "\(place): history order")
+        #expect(data.history.allSatisfy { $0.total >= 0 }, "\(place): history below zero")
+        // The rest is slower to work out, so it is looked at every few steps rather than every one.
+        guard thorough else { return }
+        // Saved and read back, it is the same data.
+        let again = try Persistence.read(try Persistence.contents(of: data))
+        #expect(again.debts == data.debts, "\(place): debts do not survive saving")
+        #expect(again.payments == data.payments, "\(place): entries do not survive saving")
+        #expect(again.history == data.history, "\(place): history does not survive saving")
+        #expect(again.settings == data.settings, "\(place): settings do not survive saving")
+        // The plan, the split and the statements can all be worked out from it.
+        let plan = store.plan
+        #expect(plan.totalInterest.isFinite && plan.totalInterest >= -0.001, "\(place): plan interest \(plan.totalInterest)")
+        #expect(!plan.finished || store.active.isEmpty || plan.debtFree != nil, "\(place): finished without a date")
+        #expect(plan.series.allSatisfy { $0.total > -0.01 && $0.total.isFinite }, "\(place): plan below zero")
+        let split = PayoffEngine.split(amount: 900, debts: data.debts, settings: data.settings, today: store.today)
+        #expect(split.total <= 900 - split.bufferKept + 0.005 && split.lines.allSatisfy { $0.amount > 0 }, "\(place): split")
+        let statements = store.statements
+        #expect(zip(statements, statements.dropFirst()).allSatisfy { abs($0.closing - $1.opening) < 0.006 }, "\(place): statements do not chain")
+        #expect(statements.isEmpty || abs((statements.last?.closing ?? 0) - store.total) < 0.006, "\(place): newest statement total")
+        #expect(store.upcoming().allSatisfy { $0.amount >= 0 }, "\(place): upcoming")
+        #expect(store.journal.undo.count <= Journal.limit, "\(place): journal")
+        _ = store.widgetSnapshot
+    }
+
+    @Test func randomUseKeepsEverythingConsistent() throws {
+        defer { AppClock.override = DemoData.today }
+        for seed in [11, 22, 33, 44, 55, 66] as [UInt64] {
+            var dice = Dice(state: seed)
+            AppClock.override = DemoData.today
+            let store = AppStore(data: demo, persists: false)
+            for step in 0..<220 {
+                var did = ""
+                switch dice.int(17) {
+                case 0, 1, 2:
+                    if let d = dice.pick(store.active) {
+                        let amount = dice.int(4) == 0 ? d.balance + 50 : dice.money(min(600, d.balance + 20)) + 0.01
+                        store.pay(d.id, amount: amount)
+                        did = "pay \(d.title) \(amount)"
+                    }
+                case 3:
+                    if let d = dice.pick(store.data.debts.filter { $0.kind == .card }) {
+                        store.charge(d.id, amount: dice.money(400) + 0.01)
+                        did = "charge \(d.title)"
+                    }
+                case 4:
+                    if var d = dice.pick(store.data.debts) {
+                        d.balance = dice.int(5) == 0 ? 0 : dice.money(5000)
+                        d.dueDay = 1 + dice.int(31)
+                        d.minimum = dice.money(300) + 1    // not always a whole number of cents: the store tidies it
+                        store.save(d)
+                        did = "edit \(d.title) to \(d.balance)"
+                    }
+                case 5:
+                    if let record = dice.pick(store.activity) {
+                        store.undo(record.id)
+                        did = "undo entry \(record.label)"
+                    }
+                case 6, 7:
+                    if let record = dice.pick(store.activity.filter { store.editBlocker($0) == nil }) {
+                        let date = Cal.addDays(-dice.int(200), to: store.today)
+                        store.edit(record.id, amount: dice.money(700) + 0.01, date: date)
+                        did = "edit entry \(record.label) to \(Fmt.isoDay(date))"
+                    }
+                case 8:
+                    let picked = store.checkInCandidates.filter { _ in dice.int(2) == 0 }
+                    store.checkIn(picked.map { .init(debtID: $0.id, balance: dice.int(6) == 0 ? 0 : ($0.balance + dice.money(60)).cents, minimum: dice.int(3) == 0 ? dice.money(90) : nil, interest: dice.int(2) == 0 ? dice.money(40) : nil) })
+                    did = "check in \(picked.count)"
+                case 9:
+                    let split = PayoffEngine.split(amount: dice.money(3000), debts: store.data.debts, settings: store.settings, today: store.today)
+                    store.apply(split, paid: Set(split.lines.filter { _ in dice.int(4) != 0 }.map(\.id)))
+                    did = "split \(split.amount)"
+                case 10:
+                    let split = PayoffEngine.extraSplit(amount: dice.money(2500), debts: store.data.debts, settings: store.settings, today: store.today)
+                    store.apply(split, paid: Set(split.lines.map(\.id)))
+                    did = "extra \(split.amount)"
+                case 11:
+                    store.undoLast()
+                    did = "undo last"
+                case 12:
+                    store.redo()
+                    did = "redo"
+                case 13:
+                    if dice.int(3) == 0, let d = dice.pick(store.data.debts) {
+                        store.delete(d.id)
+                        did = "delete \(d.title)"
+                    } else {
+                        let kind = dice.int(3)
+                        let balance = dice.money(4000) + 1
+                        var d = Debt(kind: kind == 0 ? .loan : .card, provider: "Fuzz \(step)", name: "", brand: "other", balance: balance,
+                                     apr: Double(dice.int(3500)) / 100, dueDay: 1 + dice.int(31), minimum: dice.money(200) + 5,
+                                     addedAt: store.today, startingBalance: balance)
+                        if kind == 0 { d.loanType = .personal }
+                        if kind == 1 { d.creditLimit = balance + dice.money(3000) }
+                        if kind == 2 {
+                            d.promoAPR = 0
+                            d.promoEnd = Cal.addDays(dice.int(500) - 100, to: store.today)
+                        }
+                        store.add(d)
+                        did = "add \(d.title)"
+                    }
+                case 14:
+                    store.updateSettings("Change strategy") { $0.strategy = dice.pick(Strategy.allCases) ?? .avalanche }
+                    store.updateSettings("Reorder strategy") { $0.customOrder.shuffle(using: &dice) }
+                    did = "strategy"
+                case 15:
+                    store.updateSettings("Change income") { settings in
+                        switch dice.int(4) {
+                        case 0: settings.useFixedAmount.toggle(); settings.fixedAmount = dice.money(2500); settings.fixedDay = 1 + dice.int(31)
+                        case 1: if settings.incomes.count > 0 { settings.incomes.remove(at: dice.int(settings.incomes.count)) }
+                        default:
+                            let frequency = dice.pick(PayFrequency.allCases) ?? .weekly
+                            settings.incomes.append(Income(name: "Income \(step)", amount: dice.money(1500), frequency: frequency,
+                                                           nextPayday: Cal.addDays(dice.int(25), to: AppClock.today),
+                                                           monthDays: frequency == .monthly ? [1 + dice.int(31), 1 + dice.int(31)] : []))
+                        }
+                    }
+                    did = "income"
+                default:
+                    AppClock.override = Cal.addDays(dice.int(24), to: AppClock.today)
+                    store.refreshForToday()
+                    did = "to \(Fmt.isoDay(AppClock.today))"
+                }
+                try consistent(store, "seed \(seed) step \(step) (\(did))", thorough: step % 4 == 0)
+                // Whatever was just done can be taken back and put back, exactly.
+                if store.undoLabel != nil, dice.int(5) == 0 {
+                    let before = store.data
+                    store.undoLast()
+                    try consistent(store, "seed \(seed) step \(step) after undo of (\(did))")
+                    store.redo()
+                    #expect(store.data.debts == before.debts && store.data.payments == before.payments && store.data.settings == before.settings,
+                            "seed \(seed) step \(step): undo then redo of (\(did)) is not where it started")
+                }
+            }
+        }
+    }
+
+    /// The plan the way it was first written: one day at a time, with the system calendar. Slow, and
+    /// kept only to check the fast one against.
+    private func dayByDay(_ debts: [Debt], today: Date, first: Date, frequency: PayFrequency, perPayday: Double, strategy: Strategy,
+                          order: [UUID], promoMinimumOnly: Bool) -> (interest: Double, finished: Bool, paydays: [UUID: Date]) {
+        struct W {
+            var debt: Debt
+            var accrued = 0.0
+            var due: Date?
+            var installments: [Date]
+            var firstDueLeft: Double?
+            var owed: Double { debt.balance + accrued }
+        }
+        var work: [W] = debts.filter { !$0.isPaidOff }.map { d in
+            var w = W(debt: d, due: d.kind == .payLater ? nil : d.nextUnpaidDue(), installments: d.remainingInstallmentDates)
+            if d.kind == .loan, let due = w.due {
+                let last = d.paidThrough ?? Cal.date(inMonthOf: due, monthOffset: -1, day: d.dueDay)
+                let days = min(max(0, Cal.days(from: last, to: today)), 366)
+                w.accrued = max(0, d.balance * d.apr(on: today) / 36500 * Double(days) - (d.interestTowardDue ?? 0))
+            }
+            if (d.paidTowardDue ?? 0) > 0 { w.firstDueLeft = d.scheduledPayment(on: today) }
+            return w
+        }
+        let paydays = PaydaySequence(first: first, frequency: frequency).starting(onOrAfter: today)
+        var day = today, index = 0, total = 0.0
+        var paid: [UUID: Date] = [:]
+        func owed() -> Double { work.reduce(0) { $0 + $1.owed } }
+        func pay(_ i: Int, _ amount: Double) {
+            let part = min(amount, work[i].accrued)
+            work[i].accrued -= part
+            work[i].debt.balance -= amount - part
+        }
+        var lowest = owed(), lowDay = today
+        while owed() > 0.005 && index < 3000 {
+            let payday = paydays.date(index), next = paydays.date(index + 1)
+            while day < payday {
+                for i in work.indices where work[i].debt.balance > 0 {
+                    let rate = work[i].debt.apr(on: day)
+                    guard rate > 0 else { continue }
+                    let interest = work[i].debt.balance * rate / 36500
+                    if work[i].debt.kind == .loan { work[i].accrued += interest } else { work[i].debt.balance += interest }
+                    total += interest
+                }
+                day = Cal.addDays(1, to: day)
+            }
+            var pot = perPayday
+            for i in work.indices where work[i].owed > 0.005 {
+                var sum = 0.0
+                func amount() -> Double {
+                    defer { work[i].firstDueLeft = nil }
+                    return work[i].firstDueLeft ?? work[i].debt.minimum
+                }
+                var dues = 0.0
+                if work[i].debt.kind == .payLater {
+                    while let f = work[i].installments.first, f < next {
+                        sum += amount()
+                        work[i].installments.removeFirst()
+                    }
+                    if sum > 0 { dues = work[i].installments.isEmpty ? work[i].owed : min(sum, work[i].owed) }
+                } else {
+                    while let d = work[i].due, d < next {
+                        sum += amount()
+                        work[i].due = Cal.nextDue(day: work[i].debt.dueDay, onOrAfter: Cal.addDays(1, to: d))
+                    }
+                    dues = min(sum, work[i].owed)
+                }
+                let amountPaid = min(dues, work[i].owed, pot)
+                guard amountPaid > 0 else { continue }
+                pay(i, amountPaid)
+                pot -= amountPaid
+            }
+            let queue = PayoffEngine.extraQueue(work.map(\.debt), strategy: strategy, customOrder: order, promoMinimumOnly: promoMinimumOnly, on: payday)
+            for target in queue {
+                guard pot > 0.005, let i = work.firstIndex(where: { $0.debt.id == target.id }) else { continue }
+                let amountPaid = min(pot, work[i].owed)
+                pay(i, amountPaid)
+                pot -= amountPaid
+            }
+            for i in work.indices where work[i].owed <= 0.005 && paid[work[i].debt.id] == nil {
+                work[i].debt.balance = 0
+                work[i].accrued = 0
+                paid[work[i].debt.id] = payday
+            }
+            index += 1
+            let now = owed()
+            if now < lowest - 0.005 {
+                lowest = now
+                lowDay = payday
+            } else if Cal.days(from: lowDay, to: payday) > 366 {
+                break
+            }
+        }
+        return (total, owed() <= 0.005, paid)
+    }
+
+    @Test func theFastPlanAgreesWithTheDayByDayOne() throws {
+        // 160 made-up situations: balances, rates, due days, promos that end partway, part-paid
+        // minimums, pay-later plans on every rhythm, each on a random payday schedule and strategy.
+        var dice = Dice(state: 2026)
+        var finishedCount = 0
+        for round in 0..<160 {
+            var debts = demo.debts.filter { _ in dice.int(4) != 0 }
+            for i in debts.indices {
+                var d = debts[i]
+                d.dueDay = 1 + dice.int(31)
+                d.apr = Double(dice.int(3400)) / 100
+                d.minimum = dice.money(350) + 15
+                d.balance = dice.int(9) == 0 ? 0 : dice.money(d.kind == .loan ? 20000 : 6000) + 1
+                switch d.kind {
+                case .card:
+                    if dice.int(3) == 0 {
+                        d.promoAPR = Double(dice.int(600)) / 100
+                        d.promoEnd = Cal.addDays(dice.int(700) - 60, to: today)
+                    } else {
+                        d.promoAPR = nil
+                        d.promoEnd = nil
+                    }
+                    d.paidThrough = dice.pick([nil, Cal.date(inMonthOf: today, monthOffset: -1, day: d.dueDay), Cal.date(inMonthOf: today, monthOffset: 0, day: d.dueDay)]) ?? nil
+                    if dice.int(5) == 0 { d.paidTowardDue = min(d.minimum, d.balance) / 2 }
+                case .loan:
+                    d.paidThrough = dice.pick([nil, Cal.date(inMonthOf: today, monthOffset: -1, day: d.dueDay)]) ?? nil
+                case .payLater:
+                    let count = 2 + dice.int(11), done = dice.int(count)
+                    d.installments = count
+                    d.paidInstallments = done
+                    d.every = dice.pick(InstallmentEvery.allCases)
+                    d.nextDue = Cal.addDays(dice.int(50) - 15, to: today)
+                    d.balance = (d.minimum * Double(count - done)).cents
+                    d.apr = dice.int(4) == 0 ? d.apr : 0
+                }
+                debts[i] = d
+            }
+            let frequency = dice.pick(PayFrequency.allCases) ?? .biweekly
+            let first = Cal.addDays(dice.int(22), to: today)
+            let perPayday = dice.money(3500) + 50
+            let strategy = dice.pick(Strategy.allCases) ?? .avalanche
+            var order = debts.map(\.id)
+            order.shuffle(using: &dice)
+            let held = dice.int(2) == 0
+            let fast = PayoffEngine.simulate(PlanInput(debts: debts, today: today, firstPayday: first, frequency: frequency, perPayday: perPayday,
+                                                       strategy: strategy, customOrder: order, promoMinimumOnly: held))
+            let slow = dayByDay(debts, today: today, first: first, frequency: frequency, perPayday: perPayday, strategy: strategy, order: order,
+                                promoMinimumOnly: held)
+            let place = "round \(round): \(debts.count) debts, \(frequency.rawValue), \(perPayday) a payday, \(strategy.rawValue)"
+            #expect(fast.finished == slow.finished, "\(place)")
+            guard fast.finished, slow.finished else { continue }
+            finishedCount += 1
+            #expect(abs(fast.totalInterest - slow.interest) < 0.01, "\(place): \(fast.totalInterest) against \(slow.interest)")
+            #expect(fast.payoffPayday == slow.paydays, "\(place): payoff paydays")
+        }
+        #expect(finishedCount > 80)                        // most of them are plans that work, so the comparison means something
+    }
+
+    // MARK: Setup
+
+    @Test func thePolicyAndDisclaimerMustBothBeAccepted() {
+        var settings = PlanSettings()
+        #expect(!settings.hasAcceptedLegal)
+        settings.acceptedPrivacy = Date()
+        #expect(!settings.hasAcceptedLegal)
+        settings.acceptedDisclaimer = Date()
+        settings.acceptedLegalVersion = Legal.version
+        #expect(settings.hasAcceptedLegal)
+        // New wording means asking again.
+        settings.acceptedLegalVersion = "2020-01-01"
+        #expect(!settings.hasAcceptedLegal)
+        #expect(demo.settings.hasAcceptedLegal)
+        #expect(Legal.privacy.sections.count >= 8 && Legal.disclaimer.sections.count >= 8)
+    }
+}
+
+// The older tests were written when there was one payday schedule. These read and write the first
+// income, which is the same thing.
+extension PlanSettings {
+    var nextPayday: Date {
+        get { incomes.first?.nextPayday ?? AppClock.today }
+        set { if !incomes.isEmpty { incomes[0].nextPayday = newValue } }
+    }
+    var paydayAnchorDay: Int? { incomes.first.flatMap { $0.frequency == .monthly ? $0.payDays.first : nil } }
+
+    var payAmount: Double {
+        get { incomes.first?.amount ?? 0 }
+        set { if incomes.isEmpty { incomes = [Income(amount: newValue, nextPayday: AppClock.today)] } else { incomes[0].amount = newValue } }
+    }
+
+    var payFrequency: PayFrequency {
+        get { incomes.first?.frequency ?? .biweekly }
+        set {
+            guard !incomes.isEmpty else { return }
+            incomes[0].frequency = newValue
+            incomes[0].monthDays = newValue == .monthly ? [Cal.day(of: incomes[0].nextPayday)] : []
+        }
+    }
+
+    mutating func setNextPayday(_ date: Date) {
+        guard !incomes.isEmpty else { return }
+        incomes[0].nextPayday = date
+        if incomes[0].frequency == .monthly { incomes[0].monthDays = [Cal.day(of: date)] }
+    }
+
+    struct Paydays {
+        let days: [Date]
+        func date(_ index: Int) -> Date { days[index] }
+    }
+
+    func paydays(from today: Date) -> Paydays {
+        Paydays(days: schedule(today: today).events(from: Day(today), count: 8).map(\.day.date))
+    }
+}
+
+extension AppStore {
+    /// What is left for debt out of the next paycheck.
+    var perPayday: Double { upcomingPaydays(1).first?.net ?? 0 }
 }

@@ -16,11 +16,16 @@ struct APRFreeApp: App {
 enum Route: Identifiable, Hashable {
     case debt(UUID)
     case addDebt(DebtKind?)
-    case strategy, simulator, insights, export, settings, activity, breakdown
+    case strategy, simulator, insights, income, extraMoney, export, settings, activity, breakdown
+    /// One month's statement, by the first day of the month.
+    case statement(Date)
 
     var id: String {
         switch self {
         case .debt(let id): "debt-\(id)"
+        case .statement(let month): "statement-\(month.timeIntervalSince1970)"
+        case .income: "income"
+        case .extraMoney: "extraMoney"
         case .addDebt: "addDebt"
         case .strategy: "strategy"
         case .simulator: "simulator"
@@ -33,10 +38,11 @@ enum Route: Identifiable, Hashable {
     }
 }
 
-/// A request to open the payment sheet: the payday split, or one debt.
+/// A request to open the payment sheet: the payday split, extra money that is not a paycheck, or one debt.
 struct PaymentRequest: Identifiable {
     let id = UUID()
     var debtID: UUID?
+    var extraMoney = false
 }
 
 struct RootView: View {
@@ -45,7 +51,11 @@ struct RootView: View {
 
     var body: some View {
         ZStack {
-            if store.settings.onboarded {
+            if store.settings.onboarded && !store.settings.hasAcceptedLegal {
+                // Data set up before the privacy policy and the disclaimer existed: they are shown once.
+                LegalGate()
+                    .transition(OnboardingMotion.finishTransition)
+            } else if store.settings.onboarded {
                 MainPager()
                     .transition(OnboardingMotion.finishTransition)
             } else {
@@ -68,10 +78,14 @@ struct RootView: View {
         .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active { store.refreshForToday() }
         }
+        // And it can be open on screen as midnight passes.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in
+            store.refreshForToday()
+        }
     }
 }
 
-/// Page 1 is the card stack, page 2 is Progress. Swipe between them.
+/// Page 1 is the card stack, page 2 is Progress, page 3 is Statements. Swipe between them.
 struct MainPager: View {
     @Environment(AppStore.self) private var store
     @State fileprivate var page = 0
@@ -83,12 +97,13 @@ struct MainPager: View {
             TabView(selection: $page) {
                 HomeView(route: $route, payment: $payment).tag(0)
                 ProgressPage(route: $route).tag(1)
+                StatementsPage(route: $route).tag(2)
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .background(Theme.bg)
             .ignoresSafeArea(.container, edges: .bottom)
 
-            PageDots(count: 2, index: page)
+            PageDots(count: 3, index: page)
                 .padding(.bottom, 4)
         }
         .background(Theme.bg.ignoresSafeArea())
@@ -116,6 +131,9 @@ extension MainPager {
         let name = args[i + 1].lowercased()
         switch name {
         case "progress": page = 1
+        case "statements": page = 2
+        case "income": route = .income
+        case "extra": payment = PaymentRequest(extraMoney: true)
         case "strategy": route = .strategy
         case "simulator": route = .simulator
         case "insights": route = .insights
@@ -143,6 +161,9 @@ struct RouteView: View {
         case .strategy: ToolScreen(title: "Strategy") { StrategyContent() }
         case .simulator: ToolScreen(title: "Simulator") { SimulatorContent() }
         case .insights: ToolScreen(title: "Insights") { InsightsContent() }
+        case .income: ToolScreen(title: "Income") { IncomeContent() }
+        case .extraMoney: PaymentSheet(request: PaymentRequest(extraMoney: true))
+        case .statement(let month): ToolScreen(title: "Statement") { StatementDetail(month: month) }
         case .export: ToolScreen(title: "Export") { ExportContent() }
         case .settings: ToolScreen(title: "Settings") { SettingsContent() }
         case .activity: ToolScreen(title: "Activity") { ActivityContent() }

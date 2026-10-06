@@ -10,20 +10,13 @@ struct SettingsContent: View {
     var body: some View {
         Form {
             Section {
-                Picker("Schedule", selection: bind(\.payFrequency)) {
-                    ForEach(PayFrequency.allCases) { Text($0.title).tag($0) }
+                NavigationLink {
+                    IncomeContent()
+                        .navigationTitle("Income")
+                        .navigationBarTitleDisplayMode(.inline)
+                } label: {
+                    LabeledContent("Income", value: store.settings.useFixedAmount ? "Fixed amount" : Fmt.plural(store.settings.incomes.count, "income"))
                 }
-                // Picking a date also records which day of the month monthly pay lands on.
-                DatePicker("Next payday", selection: Binding(get: { store.settings.nextPayday },
-                                                             set: { date in store.updateSettings { $0.setNextPayday(date) } }),
-                           in: store.today..., displayedComponents: .date)
-                MoneyField(title: "Usual amount", value: bind(\.payAmount))
-            } header: {
-                Text("Payday")
-            } footer: {
-                Text("Next paydays: \(store.upcomingPaydays().map(Fmt.weekday).joined(separator: " · "))")
-            }
-            Section("Plan") {
                 MoneyField(title: "Safety buffer", value: bind(\.buffer))
                 NavigationLink {
                     StrategyContent()
@@ -32,6 +25,10 @@ struct SettingsContent: View {
                 } label: {
                     LabeledContent("Strategy", value: store.settings.strategy.title)
                 }
+            } header: {
+                Text("Plan")
+            } footer: {
+                Text("The safety buffer is held back out of every paycheck. Paydays and amounts are under Income.")
             }
             Section {
                 Toggle("Due dates", isOn: reminder(\.remindDueDates))
@@ -52,6 +49,10 @@ struct SettingsContent: View {
                 } label: {
                     LabeledContent("Backup and restore", value: store.settings.lastBackup.map(Fmt.monthDay) ?? "Never")
                 }
+            }
+            Section("About") {
+                NavigationLink("Privacy Policy") { LegalReader(document: Legal.privacy) }
+                NavigationLink("Disclaimer") { LegalReader(document: Legal.disclaimer) }
             }
             Section {
                 Button("Reset Everything", role: .destructive) { confirmingReset = true }
@@ -87,7 +88,7 @@ struct SettingsContent: View {
 
     private func bind<T>(_ keyPath: WritableKeyPath<PlanSettings, T>) -> Binding<T> {
         Binding(get: { store.settings[keyPath: keyPath] },
-                set: { value in store.updateSettings { $0[keyPath: keyPath] = value } })
+                set: { value in store.updateSettings("Change safety buffer", merging: true) { $0[keyPath: keyPath] = value } })
     }
 
     /// Turning a reminder on asks for notification permission, and turns it back off if that is refused.

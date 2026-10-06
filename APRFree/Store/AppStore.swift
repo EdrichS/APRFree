@@ -8,6 +8,8 @@ final class AppStore {
     private(set) var data: AppData
     /// Set when a debt reaches zero; drives the celebration overlay.
     var celebration: Debt?
+    /// The last few actions, for Undo and Redo.
+    private(set) var journal = Journal()
     /// The day the derived numbers were last worked out for. Views that read `today` or `plan`
     /// redraw when it moves on.
     private var day = AppClock.today
@@ -16,10 +18,14 @@ final class AppStore {
     @ObservationIgnored private var planCache: PlanResult?
     /// True when a saved file exists but could not be read at launch. Nothing is saved until it has been.
     @ObservationIgnored private var awaitingSavedData = false
+    /// Set while several changes are being made as one action, so they are recorded as one.
+    @ObservationIgnored private var inTransaction = false
+    @ObservationIgnored private var journalDirty = false
 
     init(data: AppData, persists: Bool) {
         self.data = data
         self.persists = persists
+        self.data.history = History.points(debts: data.debts, payments: data.payments, today: AppClock.today)
     }
 
     /// The store the app runs on. `-demo` loads the sample debts without touching saved data;
@@ -47,6 +53,8 @@ final class AppStore {
         switch Persistence.load() {
         case .data(let saved):
             store = AppStore(data: saved, persists: true)
+            store.journal = Persistence.loadJournal()
+            store.journalDirty = false
         case .none:
             store = AppStore(data: .empty(today: AppClock.today), persists: true)
         case .unavailable:
@@ -55,7 +63,7 @@ final class AppStore {
             store = AppStore(data: .empty(today: AppClock.today), persists: true)
             store.awaitingSavedData = true
         }
-        store.rollPayday()
+        store.rollPaydays()
         store.syncOutputs()
         return store
     }
@@ -73,6 +81,8 @@ final class AppStore {
             switch Persistence.load() {
             case .data(let saved):
                 data = saved
+                journal = Persistence.loadJournal()
+                journalDirty = false
                 awaitingSavedData = false
                 stale = true
             case .none:
@@ -85,8 +95,11 @@ final class AppStore {
             day = AppClock.today
             stale = true
         }
-        if stale { planCache = nil }
-        rollPayday()
+        if stale {
+            planCache = nil
+            data.history = History.points(debts: data.debts, payments: data.payments, today: today)
+        }
+        rollPaydays()
         // A new day changes what the widget and the reminders should say, even if no data did.
         if stale { syncOutputs() }
     }
@@ -125,9 +138,6 @@ final class AppStore {
     }
 
     func debt(_ id: UUID) -> Debt? { data.debts.first { $0.id == id } }
-
-    /// What goes to debt each payday once the buffer is set aside.
-    var perPayday: Double { max(0, settings.payAmount - settings.buffer) }
 
     var dailyCost: Double { active.reduce(0) { $0 + $1.dailyCost(on: today) } }
 
@@ -180,14 +190,54 @@ final class AppStore {
     var fractionPaid: Double { fractionPaid(in: .total) }
     var changeThisMonth: Double { changeThisMonth(in: .total) }
 
+    // MARK: Income
+
+    /// The paydays the plan runs on: every income, or the fixed monthly amount standing in for them.
+    var schedule: PaySchedule { settings.schedule(today: today) }
+
+    /// True when some payday brings money for debt. Without that there is no plan to show.
+    var hasIncome: Bool { schedule.hasMoney }
+
+    /// The next few paydays across every income.
+    func upcomingPaydays(_ count: Int = 3) -> [PaySchedule.Event] {
+        schedule.events(from: Day(today), count: count)
+    }
+
+    /// The first payday on or after today, and the one after it.
+    var paydays: (current: Date, next: Date) {
+        let window = schedule.window(from: Day(today))
+        return (window.payday.date, window.next.date)
+    }
+
+    /// The amount Make a Payment opens with: what arrives on the next payday. The monthly extra rides
+    /// on the first payday of each month, the same rule the plan uses.
+    var suggestedPayment: Double {
+        let pay = schedule
+        guard let first = pay.events(from: Day(today), count: 1).first else { return 0 }
+        let firstOfMonth = pay.cursor(from: Day(today)).previous.map { $0.monthIndex != first.day.monthIndex } ?? true
+        return first.gross + (settings.extraMonthly > 0 && firstOfMonth ? settings.extraMonthly : 0)
+    }
+
+    /// Roughly what goes to debt in a month, for showing beside the incomes.
+    var monthlyForDebt: Double {
+        schedule.lines.reduce(0) { sum, line in
+            let perMonth: Double
+            switch line.frequency {
+            case .weekly: perMonth = 52.0 / 12
+            case .biweekly: perMonth = 26.0 / 12
+            case .monthly: perMonth = Double(line.monthDays.count)
+            }
+            return sum + line.net * perMonth
+        } + settings.extraMonthly
+    }
+
     // MARK: Plan
 
     func planInput(strategy: Strategy? = nil, oneTime: Double = 0, extraMonthly: Double? = nil,
-                   debts: [Debt]? = nil) -> PlanInput {
-        PlanInput(debts: debts ?? data.debts, today: today, firstPayday: settings.nextPayday,
-                  frequency: settings.payFrequency, perPayday: perPayday, strategy: strategy ?? settings.strategy,
+                   debts: [Debt]? = nil, totalsOnly: Bool = false) -> PlanInput {
+        PlanInput(debts: debts ?? data.debts, today: today, pay: schedule, strategy: strategy ?? settings.strategy,
                   customOrder: settings.customOrder, promoMinimumOnly: settings.promoMinimumOnly,
-                  oneTime: oneTime, extraMonthly: extraMonthly ?? settings.extraMonthly, anchorDay: settings.paydayAnchorDay)
+                  oneTime: oneTime, extraMonthly: extraMonthly ?? settings.extraMonthly, totalsOnly: totalsOnly)
     }
 
     /// The current plan, recomputed only after data changes.
@@ -209,7 +259,6 @@ final class AppStore {
         switch settings.strategy {
         case .avalanche: return "Highest APR first"
         case .snowball: return "Smallest balance first"
-        case .highestBalance: return "Biggest monthly interest first"
         case .custom:
             let order = extraOrder.filter { $0.kind != .payLater && !$0.hasPromo(on: today) }
             guard let first = order.first else { return "Your own order" }
@@ -252,51 +301,66 @@ final class AppStore {
         return out.sorted { $0.date < $1.date }
     }
 
-    private var paydaySequence: PaydaySequence { settings.paydays(from: today) }
-
-    /// The next few paydays, for showing the rhythm back to the user.
-    func upcomingPaydays(_ count: Int = 3) -> [Date] {
-        (0..<count).map(paydaySequence.date)
-    }
-
-    /// The first payday on or after today, and the one after it.
-    var paydays: (current: Date, next: Date) {
-        (paydaySequence.date(0), paydaySequence.date(1))
-    }
-
-    /// The amount Make a Payment opens with. The monthly extra rides on the first payday of each month,
-    /// the same rule the plan uses.
-    var suggestedPayment: Double {
-        settings.payAmount + (settings.extraMonthly > 0 && paydaySequence.isFirstInMonth(0) ? settings.extraMonthly : 0)
-    }
-
     // MARK: Writing
 
-    func update(_ change: (inout AppData) -> Void) {
+    /// Changes the data. With a `label` the change becomes a step that Undo can take back; with
+    /// `merging`, a run of the same change counts as one step.
+    func update(_ label: String? = nil, merging: Bool = false, _ change: (inout AppData) -> Void) {
+        let before = data
         change(&data)
+        if let label, !inTransaction, before != data {
+            journal.record(label, before: before, merging: merging)
+            journalDirty = true
+        }
         changed()
     }
 
-    func updateSettings(_ change: (inout PlanSettings) -> Void) {
-        update { change(&$0.settings) }
+    func updateSettings(_ label: String? = nil, merging: Bool = false, _ change: (inout PlanSettings) -> Void) {
+        update(label, merging: merging) { change(&$0.settings) }
+    }
+
+    /// Several changes recorded as a single step.
+    private func transaction(_ label: String, _ body: () -> Void) {
+        guard !inTransaction else { return body() }
+        let before = data
+        inTransaction = true
+        body()
+        inTransaction = false
+        if before != data {
+            journal.record(label, before: before)
+            journalDirty = true
+        }
+        saveJournal()
+    }
+
+    /// Money on a debt is kept to the cent, so what is in memory is exactly what gets saved.
+    private func toTheCent(_ debt: Debt) -> Debt {
+        var d = debt
+        d.balance = max(0, d.balance).cents
+        d.minimum = max(0, d.minimum).cents
+        d.startingBalance = max(0, d.startingBalance).cents
+        d.creditLimit = d.creditLimit.map { max(0, $0).cents }
+        d.total = d.total.map { max(0, $0).cents }
+        d.originalAmount = d.originalAmount.map { max(0, $0).cents }
+        return d
     }
 
     func add(_ debt: Debt) {
-        update {
+        let debt = toTheCent(debt)
+        update("Add \(debt.title)") {
             $0.debts.append(debt)
             $0.settings.customOrder.append(debt.id)
-            $0.payments.append(PaymentRecord(debtID: debt.id, title: debt.shortTitle, date: AppClock.now, amount: debt.balance,
-                                             kind: .added, balanceAfter: debt.balance))
+            $0.payments.append(PaymentRecord(debtID: debt.id, title: debt.shortTitle, date: today, amount: debt.balance,
+                                             kind: .added, balanceAfter: debt.balance, debtKind: debt.kind))
         }
     }
 
-    /// Saves an edited debt. A changed balance is logged, so the history shows statement corrections too.
+    /// Saves an edited debt. A changed balance is logged, so the history shows corrections too.
     func save(_ debt: Debt) {
-        update { data in
+        update("Edit \(debt.title)") { data in
             guard let i = data.debts.firstIndex(where: { $0.id == debt.id }) else { return }
             let old = data.debts[i]
-            var d = debt
-            d.balance = max(0, d.balance).cents
+            var d = toTheCent(debt)
             if d.kind == .card { d.startingBalance = max(d.startingBalance, d.balance) }
             let change = (d.balance - old.balance).cents
             if abs(change) >= 0.005 {
@@ -305,26 +369,30 @@ final class AppStore {
                     d.restartCycle(today: today)
                 }
                 if d.isPaidOff { d.paidOffAt = d.paidOffAt ?? today }
-                data.payments.append(PaymentRecord(debtID: d.id, title: d.shortTitle, date: AppClock.now, amount: change,
-                                                   kind: .adjustment, balanceAfter: d.balance, before: old.state))
+                data.payments.append(PaymentRecord(debtID: d.id, title: d.shortTitle, date: today, amount: change,
+                                                   kind: .adjustment, balanceAfter: d.balance, before: old.state, debtKind: d.kind))
             }
             data.debts[i] = d
         }
     }
 
-    /// Removes a debt. Its past payments stay in the activity history.
+    /// Removes a debt. Its past entries stay in the activity history, with one more that says it was
+    /// deleted and keeps a copy of it, so the deletion can be undone from there at any time.
     func delete(_ id: UUID) {
-        update {
+        guard let debt = debt(id) else { return }
+        update("Delete \(debt.title)") {
             $0.debts.removeAll { $0.id == id }
             $0.settings.customOrder.removeAll { $0 == id }
+            $0.payments.append(PaymentRecord(debtID: id, title: debt.shortTitle, date: today, amount: debt.balance, kind: .removed,
+                                             balanceAfter: 0, before: debt.state, debtKind: debt.kind, removed: debt))
         }
     }
 
     /// A new purchase on a card.
     func charge(_ id: UUID, amount: Double) {
         let amount = amount.cents
-        guard amount > 0 else { return }
-        update { data in
+        guard amount > 0, let title = debt(id)?.title else { return }
+        update("\(title) charge") { data in
             guard let i = data.debts.firstIndex(where: { $0.id == id }) else { return }
             var d = data.debts[i]
             let before = d.state
@@ -335,8 +403,8 @@ final class AppStore {
             d.balance = (d.balance + amount).cents
             d.startingBalance = (d.startingBalance + amount).cents
             data.debts[i] = d
-            data.payments.append(PaymentRecord(debtID: id, title: d.shortTitle, date: AppClock.now, amount: amount, kind: .charge,
-                                               balanceAfter: d.balance, before: before))
+            data.payments.append(PaymentRecord(debtID: id, title: d.shortTitle, date: today, amount: amount, kind: .charge,
+                                               balanceAfter: d.balance, before: before, debtKind: d.kind))
         }
     }
 
@@ -345,7 +413,7 @@ final class AppStore {
     func pay(_ id: UUID, amount requested: Double) {
         guard requested > 0, let before = debt(id), !before.isPaidOff else { return }
         var finished: Debt?
-        update { data in
+        update("\(before.title) payment") { data in
             guard let i = data.debts.firstIndex(where: { $0.id == id }) else { return }
             var d = data.debts[i]
             let before = d.state
@@ -356,85 +424,284 @@ final class AppStore {
                 finished = d
             }
             data.debts[i] = d
-            data.payments.append(PaymentRecord(debtID: id, title: d.shortTitle, date: AppClock.now, amount: result.amount, kind: result.kind,
+            data.payments.append(PaymentRecord(debtID: id, title: d.shortTitle, date: today, amount: result.amount, kind: result.kind,
                                                interest: result.interest > 0 ? result.interest : nil, balanceAfter: d.balance,
-                                               before: before))
+                                               before: before, debtKind: d.kind))
         }
         if let finished { celebration = finished }
     }
 
-    /// Applies the lines of a split that were marked paid, scheduled payments before extras.
-    func apply(_ lines: [SplitLine], allPaid: Bool, nextPayday: Date) {
-        for line in lines { pay(line.debtID, amount: line.amount) }
-        if allPaid { updateSettings { $0.nextPayday = nextPayday } }
+    /// Applies the lines of a split that were marked paid, scheduled payments before extras. A
+    /// paycheck split with every line paid uses up that payday; extra money never does.
+    func apply(_ split: Split, paid: Set<UUID>) {
+        let lines = split.lines.filter { paid.contains($0.id) }
+        guard !lines.isEmpty else { return }
+        transaction(split.isExtraMoney ? "Extra money" : "Payday split") {
+            for line in lines { pay(line.debtID, amount: line.amount) }
+            guard !split.isExtraMoney, lines.count == split.lines.count else { return }
+            updateSettings { settings in
+                if settings.useFixedAmount {
+                    settings.fixedNext = split.nextPayday
+                } else {
+                    for i in settings.incomes.indices where split.incomes.contains(settings.incomes[i].id) {
+                        settings.incomes[i].nextPayday = settings.incomes[i].payday(after: split.payday)
+                    }
+                }
+            }
+        }
     }
 
-    // MARK: Undo
+    // MARK: Statement check-in
 
-    /// Why an entry cannot be undone, or nil when it can.
+    struct StatementEntry {
+        var debtID: UUID
+        /// What the statement says is owed.
+        var balance: Double
+        /// The minimum payment it asks for, if it changed.
+        var minimum: Double?
+        /// The interest it charged, if entered.
+        var interest: Double?
+    }
+
+    /// The monthly check-in: each balance is set to what its statement says. The difference is the
+    /// interest and anything else the app had not seen, which is how a card's balance keeps up with
+    /// the real one.
+    func checkIn(_ entries: [StatementEntry]) {
+        guard !entries.isEmpty else { return }
+        transaction("Statement check-in") {
+            update { data in
+                for entry in entries {
+                    guard let i = data.debts.firstIndex(where: { $0.id == entry.debtID }) else { continue }
+                    var d = data.debts[i]
+                    let before = d.state
+                    let balance = Limits.money(entry.balance).cents
+                    let change = (balance - d.balance).cents
+                    if d.isPaidOff && balance > 0.005 {
+                        d.paidOffAt = nil
+                        d.restartCycle(today: today)
+                    }
+                    d.balance = balance
+                    // Interest on a card is new debt, like a charge, so it does not count against what has been paid.
+                    if d.kind == .card, change > 0 { d.startingBalance = (d.startingBalance + change).cents }
+                    if d.isPaidOff { d.paidOffAt = d.paidOffAt ?? today }
+                    if let minimum = entry.minimum, minimum > 0 { d.minimum = Limits.money(minimum).cents }
+                    d.statementThrough = today
+                    data.debts[i] = d
+                    data.payments.append(PaymentRecord(debtID: d.id, title: d.shortTitle, date: today, amount: change, kind: .statement,
+                                                       interest: entry.interest.flatMap { $0 > 0 ? $0.cents : nil }, balanceAfter: d.balance,
+                                                       before: before, debtKind: d.kind))
+                }
+            }
+        }
+    }
+
+    /// The cards with a balance that have not been checked against a statement this month. Loans
+    /// are not waited for: the app works out their interest itself, payment by payment.
+    var awaitingCheckIn: [Debt] {
+        let month = Cal.monthStart(today)
+        return active.filter { $0.kind == .card && ($0.statementThrough.map { Cal.monthStart($0) < month } ?? true) }
+    }
+
+    /// Everything a statement check-in can cover: every card, including one at zero that may have a
+    /// new balance, and every loan still being paid.
+    var checkInCandidates: [Debt] {
+        data.debts.filter { $0.kind == .card || ($0.kind == .loan && !$0.isPaidOff) }
+    }
+
+    // MARK: Undo, redo and editing entries
+
+    /// What Undo would take back, or nil when there is nothing.
+    var undoLabel: String? { journal.undo.last?.label }
+    /// What Redo would put back, or nil when there is nothing.
+    var redoLabel: String? { journal.redo.last?.label }
+
+    /// Takes back the last action, whatever it was: a payment, an edit, a deleted debt.
+    func undoLast() {
+        guard let step = journal.takeBack(current: data) else { return }
+        journalDirty = true
+        data = step.data.keepingDeviceSettings(of: data)
+        celebration = nil
+        changed()
+        // The step may be from before a payday passed.
+        rollPaydays()
+    }
+
+    /// Puts back the action that was last undone.
+    func redo() {
+        guard let step = journal.putBack(current: data) else { return }
+        journalDirty = true
+        data = step.data.keepingDeviceSettings(of: data)
+        changed()
+        rollPaydays()
+    }
+
+    /// Why an entry cannot be undone on its own, or nil when it can.
     func undoBlocker(_ record: PaymentRecord) -> String? {
-        guard record.kind == .added else { return nil }
-        return debt(record.debtID) == nil
-            ? "This marks when \(record.title) was added."
-            : "This marks when \(record.title) was added. To remove it, delete \(record.title) from its own screen."
+        switch record.kind {
+        case .added:
+            return debt(record.debtID) == nil
+                ? "This marks when \(record.title) was added."
+                : "This marks when \(record.title) was added. To remove it, delete \(record.title) from its own screen."
+        case .removed:
+            return record.removed == nil ? "This marks when \(record.title) was deleted." : nil
+        default:
+            return nil
+        }
     }
 
     /// Takes one entry back. The debt returns to how it stood just before the entry, then everything
     /// recorded after it for that debt is applied again in order, so later entries keep their meaning:
     /// undoing a minimum, for instance, lets the next payment count toward that due date instead.
+    /// Undoing a "deleted" entry brings the debt back.
     func undo(_ id: UUID) {
         guard let record = data.payments.first(where: { $0.id == id }), record.kind != .added else { return }
-        update { data in
-            guard let index = data.payments.firstIndex(where: { $0.id == id }) else { return }
-            data.payments.remove(at: index)
+        update("Remove \(record.label)") { data in
+            if record.kind == .removed {
+                guard let debt = record.removed, !data.debts.contains(where: { $0.id == debt.id }) else { return }
+                data.payments.removeAll { $0.id == id }
+                data.debts.append(debt)
+                data.settings.customOrder.append(debt.id)
+                return
+            }
             // If the debt itself was deleted, only the entry can go.
-            guard let di = data.debts.firstIndex(where: { $0.id == record.debtID }) else { return }
-            var d = data.debts[di]
-            if let before = record.before {
-                d.state = before
-            } else {
-                d.reverse(record)
+            guard data.debts.contains(where: { $0.id == record.debtID }) else {
+                data.payments.removeAll { $0.id == id }
+                return
             }
-            var dropped: [UUID] = []
-            for i in data.payments.indices where i >= index && data.payments[i].debtID == d.id {
-                if let again = d.reapply(data.payments[i]) {
-                    data.payments[i] = again
-                } else {
-                    dropped.append(data.payments[i].id)
-                }
-            }
-            data.payments.removeAll { dropped.contains($0.id) }
-            data.debts[di] = d
+            let mine = data.payments.filter { $0.debtID == record.debtID }
+            guard let position = mine.firstIndex(where: { $0.id == id }) else { return }
+            AppStore.rewrite(&data, debtID: record.debtID, from: position, with: Array(mine.dropFirst(position + 1)))
         }
         if celebration?.id == record.debtID { celebration = nil }
     }
 
-    func restore(_ restored: AppData) {
-        update { $0 = restored }
-        rollPayday()
+    /// Why an entry cannot be changed, or nil when it can.
+    func editBlocker(_ record: PaymentRecord) -> String? {
+        if !record.isEditable { return "Only payments and charges can be changed." }
+        if debt(record.debtID) == nil { return "\(record.title) has been deleted, so its entries can no longer be changed." }
+        return nil
     }
 
-    /// Moves a payday that has passed forward to the next one on the same rhythm.
-    func rollPayday() {
-        guard settings.nextPayday < today else { return }
-        let next = settings.paydays(from: today).date(0)
-        updateSettings { $0.nextPayday = next }
+    /// Changes an entry's amount or day. The debt is put back to how it stood before the earliest
+    /// entry this touches, and everything from there on is applied again in date order.
+    func edit(_ id: UUID, amount: Double, date: Date) {
+        guard let record = data.payments.first(where: { $0.id == id }), editBlocker(record) == nil,
+              let debt = debt(record.debtID) else { return }
+        let amount = Limits.money(amount).cents
+        let day = min(max(Cal.startOfDay(date), debt.addedAt), today)
+        guard amount > 0, amount != record.amount || day != record.date else { return }
+        update("Edit \(record.label)") { (data: inout AppData) in
+            let mine: [PaymentRecord] = data.payments.filter { $0.debtID == record.debtID }
+            guard let position = mine.firstIndex(where: { $0.id == id }) else { return }
+            var changed = mine
+            changed[position].amount = amount
+            changed[position].date = day
+            // A new day can move the entry past its neighbours. Entries keep their order within a day.
+            let sorted: [PaymentRecord] = AppStore.inDateOrder(changed)
+            let moved: Int? = mine.indices.first { mine[$0].id != sorted[$0].id }
+            let first: Int = min(position, moved ?? position)
+            AppStore.rewrite(&data, debtID: record.debtID, from: first, with: Array(sorted.dropFirst(first)))
+        }
+    }
+
+    /// Entries oldest first. Ones on the same day keep the order they were in.
+    private static func inDateOrder(_ entries: [PaymentRecord]) -> [PaymentRecord] {
+        let numbered: [(offset: Int, element: PaymentRecord)] = Array(entries.enumerated())
+        let sorted = numbered.sorted { (a, b) -> Bool in
+            a.element.date != b.element.date ? a.element.date < b.element.date : a.offset < b.offset
+        }
+        return sorted.map { $0.element }
+    }
+
+    /// Puts a debt back to how it stood before its entry number `position`, then applies `entries`
+    /// in its place and after it. An entry that no longer does anything (a payment on a debt that is
+    /// now already cleared) is dropped.
+    private static func rewrite(_ data: inout AppData, debtID: UUID, from position: Int, with entries: [PaymentRecord]) {
+        guard let di = data.debts.firstIndex(where: { $0.id == debtID }) else { return }
+        let slots = data.payments.indices.filter { data.payments[$0].debtID == debtID }
+        guard position < slots.count else { return }
+        var d = data.debts[di]
+        // Walk back from the newest entry. An entry that kept the state before it gives that exactly;
+        // one from before that was kept is reversed by its amount.
+        for slot in slots[position...].reversed() {
+            let record = data.payments[slot]
+            if let before = record.before { d.state = before } else { d.reverse(record) }
+        }
+        var replayed = Array(slots[..<position].map { data.payments[$0] })
+        for entry in entries {
+            if let again = d.reapply(entry) { replayed.append(again) }
+        }
+        // The debt's entries go back into the places they held among everyone else's.
+        for (slot, record) in zip(slots, replayed) { data.payments[slot] = record }
+        for slot in slots.dropFirst(replayed.count).reversed() { data.payments.remove(at: slot) }
+        data.debts[di] = d
+    }
+
+    // MARK: Whole-data changes
+
+    /// Replaces everything with a backup. What was accepted on this iPhone stays accepted: a backup
+    /// made before the policy existed should not ask for it again.
+    func restore(_ restored: AppData) {
+        update("Restore backup") { data in
+            var incoming = restored
+            if data.settings.hasAcceptedLegal {
+                incoming.settings.acceptedPrivacy = data.settings.acceptedPrivacy
+                incoming.settings.acceptedDisclaimer = data.settings.acceptedDisclaimer
+                incoming.settings.acceptedLegalVersion = data.settings.acceptedLegalVersion
+            }
+            incoming.settings.onboarded = true
+            data = incoming
+        }
+        rollPaydays()
+    }
+
+    /// Moves every payday that has passed forward to the next one on the same rhythm.
+    func rollPaydays() {
+        let stale = settings.incomes.contains { $0.nextPayday < today } || (settings.fixedNext.map { $0 < today } ?? false)
+        guard stale else { return }
+        updateSettings { settings in
+            for i in settings.incomes.indices where settings.incomes[i].nextPayday < today {
+                settings.incomes[i].nextPayday = settings.incomes[i].paydays(from: today, count: 1).first ?? today
+            }
+            if let next = settings.fixedNext, next < today { settings.fixedNext = nil }
+        }
     }
 
     /// Erases every debt, payment and setting, and goes back to the first-run setup.
     func reset() {
         celebration = nil
         UserDefaults.standard.removeObject(forKey: "progressScope")
+        journal = Journal()
+        journalDirty = true
         update { $0 = .empty(today: today) }
-        if persists { Reminders.clearDelivered() }
+        guard persists else { return }
+        // "Everything" includes what sits beside the data: the copy kept from before an upgrade,
+        // exports waiting to be shared, reminders already delivered, and the widget's hidden switch.
+        Persistence.eraseSideFiles()
+        Exporter.removeExports()
+        WidgetSnapshot.balancesHidden = false
+        Reminders.clearDelivered()
+    }
+
+    /// Marks the one-time notices as read.
+    func dismissNotices() {
+        guard !settings.notices.isEmpty else { return }
+        updateSettings { $0.notices = [] }
     }
 
     private func changed() {
         planCache = nil
-        recordHistory()
+        data.history = History.points(debts: data.debts, payments: data.payments, today: today)
         guard persists, !awaitingSavedData else { return }
         Persistence.save(data)
+        if !inTransaction { saveJournal() }
         syncOutputs()
+    }
+
+    private func saveJournal() {
+        guard persists, !awaitingSavedData, journalDirty else { return }
+        Persistence.save(journal)
+        journalDirty = false
     }
 
     /// Brings everything outside the app in line with the data: the widget and the reminders.
@@ -445,32 +712,16 @@ final class AppStore {
         Reminders.reschedule(for: data, today: today)
     }
 
-    /// Keeps one balance point per day, written whenever any of the three totals moves.
-    private func recordHistory() {
-        let now = BalancePoint(date: today, total: total.cents, cards: total(of: .card).cents, loans: total(of: .loan).cents)
-        if let last = data.history.last {
-            let same = abs(last.total - now.total) < 0.005 && abs((last.cards ?? -1) - (now.cards ?? 0)) < 0.005
-                && abs((last.loans ?? -1) - (now.loans ?? 0)) < 0.005
-            guard !same else { return }
-            if Cal.startOfDay(last.date) == today {
-                data.history[data.history.count - 1] = now
-                return
-            }
-        } else if data.debts.isEmpty {
-            return
-        }
-        data.history.append(now)
-    }
-
     var widgetSnapshot: WidgetSnapshot {
         func snapshot(_ scope: DebtScope) -> ScopeSnapshot {
             let coming = upcoming(days: 60, in: scope)
             let next = coming.first?.date
             let names = coming.filter { $0.date == next }.map(\.debt.shortTitle)
-            return ScopeSnapshot(balance: balance(in: scope), changeThisMonth: changeThisMonth(in: scope), nextDue: next,
-                                 nextDueNames: names.joined(separator: ", "), free: free(in: scope),
-                                 fractionPaid: fractionPaid(in: scope))
+            let nextDue: Day? = next.map { Day($0) }
+            let free: Day? = free(in: scope).map { Day($0) }
+            return ScopeSnapshot(balance: balance(in: scope), changeThisMonth: changeThisMonth(in: scope), nextDue: nextDue,
+                                 nextDueNames: names.joined(separator: ", "), free: free, fractionPaid: fractionPaid(in: scope))
         }
-        return WidgetSnapshot(total: snapshot(.total), cards: snapshot(.cards), loans: snapshot(.loans), zone: Cal.zone.identifier)
+        return WidgetSnapshot(total: snapshot(.total), cards: snapshot(.cards), loans: snapshot(.loans))
     }
 }

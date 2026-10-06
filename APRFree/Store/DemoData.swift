@@ -97,24 +97,20 @@ enum DemoData {
         log(klarna, Cal.date(2026, 10, 1), .installment, 49.99, after: 99.98, installmentsPaid: 1, nextDue: Cal.date(2026, 10, 1))
         payments.sort { $0.date < $1.date }
 
-        // Balance history: the balances those records left, at each month end and today.
-        func balances(on date: Date) -> BalancePoint {
-            func balance(_ d: Debt) -> Double { payments.last { $0.debtID == d.id && $0.date <= date }?.balanceAfter ?? 0 }
-            let cardTotal = cards.reduce(0) { $0 + balance($1) }
-            let loanTotal = balance(auto) + balance(student)
-            let laterTotal = balance(klarna) + balance(affirm)
-            return BalancePoint(date: date, total: (cardTotal + loanTotal + laterTotal).cents, cards: cardTotal.cents, loans: loanTotal.cents)
-        }
-        var history = (4...10).map { balances(on: Cal.addDays(-1, to: Cal.date(2026, $0, 1))) }
-        history.append(balances(on: today))
+        var settings = PlanSettings(nextPayday: Cal.date(2026, 10, 9), payFrequency: .biweekly, payAmount: 1200, buffer: 50)
+        settings.strategy = .custom
+        // Citi is ranked by the APR it will have once its promo ends; until then it is held at the minimum.
+        settings.customOrder = [chase, capitalOne, citi, amex, bofa, auto, student, klarna, affirm].map(\.id)
+        settings.remindDueDates = true
+        settings.remindPaydays = true
+        settings.lastBackup = Cal.date(2026, 10, 1)
+        settings.onboarded = true
+        settings.acceptedPrivacy = Cal.date(2026, 3, 31)
+        settings.acceptedDisclaimer = Cal.date(2026, 3, 31)
+        settings.acceptedLegalVersion = Legal.version
 
-        let settings = PlanSettings(payFrequency: .biweekly, nextPayday: Cal.date(2026, 10, 9), payAmount: 1200, buffer: 50,
-                                    strategy: .custom,
-                                    // Citi is ranked by the APR it will have once its promo ends; until then it is held at the minimum.
-                                    customOrder: [chase, capitalOne, citi, amex, bofa, auto, student, klarna, affirm].map(\.id),
-                                    promoMinimumOnly: true, extraMonthly: 0, remindDueDates: true, remindPaydays: true,
-                                    lastBackup: Cal.date(2026, 10, 1), onboarded: true)
-
+        // Balance history is worked out from the records, the same way the app does it.
+        let history = History.points(debts: debts, payments: payments, today: today)
         return AppData(debts: debts, payments: payments, history: history, settings: settings)
     }
 }

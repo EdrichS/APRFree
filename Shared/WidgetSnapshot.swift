@@ -36,10 +36,10 @@ struct ScopeSnapshot: Codable, Equatable {
     var balance: Double
     /// Negative when the balance went down this month.
     var changeThisMonth: Double
-    var nextDue: Date?
+    var nextDue: Day?
     var nextDueNames: String
     /// The month this scope reaches zero on the current plan.
-    var free: Date?
+    var free: Day?
     var fractionPaid: Double
 
     static let empty = ScopeSnapshot(balance: 0, changeThisMonth: 0, nextDue: nil, nextDueNames: "", free: nil, fractionPaid: 0)
@@ -51,11 +51,6 @@ struct WidgetSnapshot: Codable, Equatable {
     var total: ScopeSnapshot
     var cards: ScopeSnapshot
     var loans: ScopeSnapshot
-    /// The time zone the dates were written in, so the widget shows the same days the app does.
-    var zone: String?
-
-    /// The zone to show dates in.
-    var timeZone: TimeZone { zone.flatMap(TimeZone.init(identifier:)) ?? .current }
 
     func scope(_ scope: DebtScope) -> ScopeSnapshot {
         switch scope {
@@ -66,7 +61,14 @@ struct WidgetSnapshot: Codable, Equatable {
     }
 
     static let appGroup = "group.com.edrichsilva.APRFree"
-    private static let key = "widgetSnapshot.v2"
+    private static let key = "widgetSnapshot.v3"
+    private static let hiddenKey = "widgetBalancesHidden"
+
+    /// Whether the widgets show dots in place of balances. Set from the widget itself with the eye button.
+    static var balancesHidden: Bool {
+        get { UserDefaults(suiteName: appGroup)?.bool(forKey: hiddenKey) ?? false }
+        set { UserDefaults(suiteName: appGroup)?.set(newValue, forKey: hiddenKey) }
+    }
 
     static let empty = WidgetSnapshot(total: .empty, cards: .empty, loans: .empty)
 
@@ -85,6 +87,8 @@ struct WidgetSnapshot: Codable, Equatable {
         guard let raw = try? JSONEncoder().encode(self) else { return }
         let defaults = UserDefaults(suiteName: Self.appGroup)
         defaults?.set(raw, forKey: Self.key)
-        defaults?.removeObject(forKey: "widgetSnapshot")   // the single-scope snapshot from before widgets had options
+        // Snapshots in the formats earlier versions wrote.
+        defaults?.removeObject(forKey: "widgetSnapshot")
+        defaults?.removeObject(forKey: "widgetSnapshot.v2")
     }
 }

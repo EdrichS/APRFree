@@ -44,12 +44,10 @@ enum Reminders {
             }
         }
 
-        if data.settings.remindPaydays, data.settings.payAmount > 0 {
-            let paydays = data.settings.paydays(from: today)
-            for i in 0..<4 {
-                let day = paydays.date(i)
-                add("payday-\(Int(day.timeIntervalSince1970))", on: day, title: "It’s payday",
-                    body: "Split \(data.settings.payAmount.usd) with Make a Payment")
+        if data.settings.remindPaydays {
+            for event in data.settings.schedule(today: today).events(from: Day(today), count: 6) where event.gross > 0 {
+                add("payday-\(event.day)", on: event.day.date, title: "It’s payday",
+                    body: "Split \(event.gross.usd) with Make a Payment")
             }
         }
 

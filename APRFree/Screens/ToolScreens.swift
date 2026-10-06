@@ -15,7 +15,7 @@ struct StrategyContent: View {
         List {
             Section {
                 ForEach(Strategy.allCases) { strategy in
-                    Button { store.updateSettings { $0.strategy = strategy } } label: {
+                    Button { store.updateSettings("Change strategy") { $0.strategy = strategy } } label: {
                         HStack(spacing: 12) {
                             RadioMark(on: store.settings.strategy == strategy)
                             VStack(alignment: .leading, spacing: 0) {
@@ -53,7 +53,7 @@ struct StrategyContent: View {
             }
             Section {
                 Toggle("0% promo cards: minimum only until the promo ends",
-                       isOn: Binding(get: { store.settings.promoMinimumOnly }, set: { on in store.updateSettings { $0.promoMinimumOnly = on } }))
+                       isOn: Binding(get: { store.settings.promoMinimumOnly }, set: { on in store.updateSettings("Change promo setting") { $0.promoMinimumOnly = on } }))
                     .toggleStyle(NeutralToggleStyle())
             }
             Section("Compare") {
@@ -67,10 +67,6 @@ struct StrategyContent: View {
         if debt.hasPromo(on: store.today) {
             return "\(Fmt.percent(debt.promoAPR ?? 0)) promo\(store.settings.promoMinimumOnly ? " · minimum only" : "")"
         }
-        // Highest Balance ranks by the dollars of interest each debt charges in a month, so that is what the row shows.
-        if store.settings.strategy == .highestBalance {
-            return "\(debt.monthlyInterest(on: store.today).usd) a month in interest · \(Fmt.percent(debt.apr))"
-        }
         return "\(Fmt.percent(debt.apr)) · \(debt.balance.usd)"
     }
 
@@ -78,7 +74,7 @@ struct StrategyContent: View {
         var ids = order.map(\.id)
         ids.move(fromOffsets: source, toOffset: destination)
         let rest = store.settings.customOrder.filter { !ids.contains($0) }
-        store.updateSettings { $0.customOrder = ids + rest }
+        store.updateSettings("Reorder strategy") { $0.customOrder = ids + rest }
     }
 }
 
@@ -215,7 +211,7 @@ struct SimulatorContent: View {
         }
         .safeAreaInset(edge: .bottom) {
             Button("Use This Plan") {
-                store.updateSettings {
+                store.updateSettings("Use simulator plan") {
                     $0.strategy = strategy
                     $0.extraMonthly = monthly
                 }
@@ -349,9 +345,9 @@ struct SimulatorContent: View {
                 TileNote("The purchase is added to \(card.title), your highest APR.")
             }
             if !base.finished {
-                TileNote(store.perPayday > 0.005
+                TileNote(store.hasIncome
                          ? "Your current plan never clears the debt. Try a larger monthly amount."
-                         : "There is no current plan yet: add your payday amount in Settings, or try a monthly amount here.")
+                         : "There is no current plan yet: add your income under Tools, or try a monthly amount here.")
             }
         }
     }
@@ -621,7 +617,7 @@ struct ExportContent: View {
                 CardGroup {
                     shareRow("tablecells", "CSV export", "Debts and payments as a spreadsheet", csvURL)
                     RowDivider(inset: 68)
-                    shareRow("doc.text", "PDF summary", "A one-page snapshot of your debts", pdfURL)
+                    shareRow("doc.text", "PDF report", "Your debts, plan and charts, ready to print", pdfURL)
                 }
                 SectionHeader(title: "Backup").padding(.top, 18)
                 CardGroup {
@@ -673,8 +669,7 @@ struct ExportContent: View {
 
     private func prepare() {
         csvURL = Exporter.write(Data(Exporter.csv(store.data).utf8), named: "APRFree.csv")
-        pdfURL = Exporter.write(Exporter.pdf(data: store.data, plan: store.plan, strategy: store.strategySummary, today: store.today),
-                                named: "APRFree summary.pdf")
+        pdfURL = Exporter.write(Report.pdf(for: store), named: "APRFree report.pdf")
     }
 
     @ViewBuilder private func shareRow(_ symbol: String, _ title: String, _ detail: String, _ url: URL?) -> some View {

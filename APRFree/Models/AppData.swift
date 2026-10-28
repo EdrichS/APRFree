@@ -116,6 +116,12 @@ struct PlanSettings: Codable, Equatable {
     var extraMonthly: Double = 0
     var remindDueDates = false
     var remindPaydays = false
+    /// Once a month, a reminder to check each card against its statement.
+    var remindCheckIn = false
+    /// The day of the month that reminder arrives on.
+    var checkInDay = 1
+    /// Connected mode: off unless it is turned on, and everything it knows about bank sign-ins.
+    var connected = ConnectedState()
     var lastBackup: Date?
     var onboarded = false
     /// When the privacy policy and the disclaimer were accepted, and which wording.
@@ -151,6 +157,9 @@ struct PlanSettings: Codable, Equatable {
         extraMonthly = try c.decodeIfPresent(Double.self, forKey: .extraMonthly) ?? 0
         remindDueDates = try c.decodeIfPresent(Bool.self, forKey: .remindDueDates) ?? false
         remindPaydays = try c.decodeIfPresent(Bool.self, forKey: .remindPaydays) ?? false
+        remindCheckIn = try c.decodeIfPresent(Bool.self, forKey: .remindCheckIn) ?? false
+        checkInDay = try c.decodeIfPresent(Int.self, forKey: .checkInDay) ?? 1
+        connected = try c.decodeIfPresent(ConnectedState.self, forKey: .connected) ?? ConnectedState()
         lastBackup = try c.decodeIfPresent(Date.self, forKey: .lastBackup)
         onboarded = try c.decodeIfPresent(Bool.self, forKey: .onboarded) ?? false
         acceptedPrivacy = try c.decodeIfPresent(Date.self, forKey: .acceptedPrivacy)
@@ -250,6 +259,7 @@ struct AppData: Codable, Equatable {
         settings.incomes = Array(settings.incomes.prefix(12))
         settings.fixedAmount = Limits.money(settings.fixedAmount)
         settings.fixedDay = min(max(1, settings.fixedDay), 31)
+        settings.checkInDay = min(max(1, settings.checkInDay), 31)
         settings.buffer = Limits.money(settings.buffer)
         settings.extraMonthly = Limits.money(settings.extraMonthly)
     }

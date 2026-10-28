@@ -568,9 +568,9 @@ struct InsightsContent: View {
         let end = Cal.monthStart(store.today)
         let paid = store.data.payments.filter { $0.isPayment && $0.date >= start && $0.date < end }.reduce(0) { $0 + $1.amount }
         if paid > 0 {
-            let interest = store.data.debts.reduce(0.0) { sum, debt in
-                sum + (PayoffEngine.pastSlices(debt: debt, payments: store.data.payments, today: store.today, months: 1).first?.interest ?? 0)
-            }
+            // The recorded figure once the month has a statement check-in, so this and the statement agree.
+            let recorded = store.interest(inMonth: start)
+            let interest = recorded.amount
             // The balance change comes from the recorded history when it covers the month; otherwise it is estimated.
             let before = store.balance(in: .total, before: start), after = store.balance(in: .total, before: end)
             let down = before.flatMap { b in after.map { b - $0 } } ?? (paid - interest)
@@ -579,7 +579,7 @@ struct InsightsContent: View {
                 HStack {
                     recapPart("Paid", paid.usd, .primary)
                     Spacer()
-                    recapPart("Interest, about", interest.usd, .primary)
+                    recapPart(recorded.isRecorded ? "Interest recorded" : "Interest, about", interest.usd, .primary)
                     Spacer()
                     if down >= 0 {
                         recapPart("Balance down", down.usd, Theme.green)
@@ -587,6 +587,10 @@ struct InsightsContent: View {
                         recapPart("Balance up", (-down).usd, .primary)
                     }
                 }
+                TileNote(recorded.isRecorded
+                         ? "Interest is what \(Fmt.monthName(start))’s statement check-ins and loan payments recorded: the same figure as its statement."
+                         : "Interest is an estimate. \(Fmt.monthName(start)) has no statement check-in, so its statement shows only what was recorded.")
+                    .padding(.top, 6)
             }
         }
     }

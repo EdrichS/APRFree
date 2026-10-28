@@ -22,10 +22,11 @@ enum Exporter {
                          d.installments.map(String.init) ?? "", d.paidInstallments.map(String.init) ?? ""].map(cell).joined(separator: ","))
         }
         rows.append("")
-        rows.append("Date,Debt,Kind,Amount,Interest,Balance after")
+        rows.append("Date,Debt,Kind,Amount,Interest,Balance after,Note")
         for p in data.payments.sorted(by: { $0.date < $1.date }) {
-            rows.append([day(p.date), p.title, p.kind.rawValue, money(p.amount), money(p.interest), money(p.balanceAfter)]
-                .map(cell).joined(separator: ","))
+            let note = [p.bank.map { "From \($0)" }, p.note].compactMap { $0 }.joined(separator: ": ")
+            rows.append([day(p.date), p.title, p.bank == nil ? p.kind.rawValue : "bank update", money(p.amount), money(p.interest),
+                         money(p.balanceAfter), note].map(cell).joined(separator: ","))
         }
         return rows.joined(separator: "\n") + "\n"
     }
@@ -67,6 +68,14 @@ struct BackupDocument: FileDocument {
     }
 
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
-        FileWrapper(regularFileWithContents: try Persistence.contents(of: data))
+        FileWrapper(regularFileWithContents: try BackupDocument.contents(of: data))
+    }
+
+    /// What goes into a backup file: everything except Connected mode. Bank sign-ins belong to the
+    /// iPhone they were made on, so they are left out; entries that came from a bank stay.
+    static func contents(of data: AppData) throws -> Data {
+        var copy = data
+        copy.settings.connected = ConnectedState()
+        return try Persistence.contents(of: copy)
     }
 }

@@ -16,7 +16,7 @@ struct APRFreeApp: App {
 enum Route: Identifiable, Hashable {
     case debt(UUID)
     case addDebt(DebtKind?)
-    case strategy, simulator, insights, income, extraMoney, export, settings, activity, breakdown
+    case strategy, simulator, insights, income, extraMoney, export, settings, activity, breakdown, connected
     /// One month's statement, by the first day of the month.
     case statement(Date)
 
@@ -34,6 +34,7 @@ enum Route: Identifiable, Hashable {
         case .settings: "settings"
         case .activity: "activity"
         case .breakdown: "breakdown"
+        case .connected: "connected"
         }
     }
 }
@@ -76,7 +77,10 @@ struct RootView: View {
         .environment(\.timeZone, Cal.zone)
         // The app can sit in memory overnight. Coming back to the front, the date may have changed.
         .onChange(of: scenePhase, initial: true) { _, phase in
-            if phase == .active { store.refreshForToday() }
+            guard phase == .active else { return }
+            store.refreshForToday()
+            // With Connected mode on, the banks are asked for new figures at most once a day.
+            Task { await store.refreshBanksIfDue() }
         }
         // And it can be open on screen as midnight passes.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)) { _ in
@@ -85,7 +89,8 @@ struct RootView: View {
     }
 }
 
-/// Page 1 is the card stack, page 2 is Progress, page 3 is Statements. Swipe between them.
+/// Page 1 is the card stack, page 2 is Progress, page 3 is Statements, page 4 is Credit
+/// Utilization. Swipe between them.
 struct MainPager: View {
     @Environment(AppStore.self) private var store
     @State fileprivate var page = 0
@@ -98,12 +103,13 @@ struct MainPager: View {
                 HomeView(route: $route, payment: $payment).tag(0)
                 ProgressPage(route: $route).tag(1)
                 StatementsPage(route: $route).tag(2)
+                UtilizationPage().tag(3)
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .background(Theme.bg)
             .ignoresSafeArea(.container, edges: .bottom)
 
-            PageDots(count: 3, index: page)
+            PageDots(count: 4, index: page)
                 .padding(.bottom, 4)
         }
         .background(Theme.bg.ignoresSafeArea())
@@ -123,8 +129,9 @@ struct MainPager: View {
 
 #if DEBUG
 extension MainPager {
-    /// `-screen <name>` opens straight on a screen, for screenshots: progress, strategy, simulator,
-    /// insights, export, settings, add, pay, celebrate, or a debt's provider name such as "chase" or "klarna".
+    /// `-screen <name>` opens straight on a screen, for screenshots: progress, statements, utilization,
+    /// strategy, simulator, insights, income, extra, export, settings, connected, activity, breakdown,
+    /// add, pay, celebrate, or a debt's provider name such as "chase" or "klarna".
     fileprivate func openDebugRoute() {
         let args = ProcessInfo.processInfo.arguments
         guard let i = args.firstIndex(of: "-screen"), args.count > i + 1 else { return }
@@ -132,6 +139,8 @@ extension MainPager {
         switch name {
         case "progress": page = 1
         case "statements": page = 2
+        case "utilization": page = 3
+        case "connected": route = .connected
         case "income": route = .income
         case "extra": payment = PaymentRequest(extraMoney: true)
         case "strategy": route = .strategy
@@ -168,6 +177,7 @@ struct RouteView: View {
         case .settings: ToolScreen(title: "Settings") { SettingsContent() }
         case .activity: ToolScreen(title: "Activity") { ActivityContent() }
         case .breakdown: ToolScreen(title: "Balances") { BreakdownContent() }
+        case .connected: ToolScreen(title: "Connected") { ConnectedContent() }
         }
     }
 }

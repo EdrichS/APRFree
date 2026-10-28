@@ -8,9 +8,11 @@ struct ActivityRow: View {
     var forOneDebt = false
 
     private var detail: String {
-        let date = forOneDebt ? Fmt.full(record.date) : Fmt.monthDay(record.date)
-        guard let interest = record.interest, interest > 0 else { return date }
-        return "\(date) · \(interest.usd) interest"
+        var parts = [forOneDebt ? Fmt.full(record.date) : Fmt.monthDay(record.date)]
+        if let interest = record.interest, interest > 0 { parts.append("\(interest.usd) interest") }
+        // What a bank update changed besides the balance.
+        if let note = record.note { parts.append(note) }
+        return parts.joined(separator: " · ")
     }
 
     var body: some View {
@@ -25,7 +27,7 @@ struct ActivityRow: View {
             case .adjustment:
                 IconCircle(symbol: "pencil", size: 36)
             case .statement:
-                IconCircle(symbol: "doc.text", size: 36)
+                IconCircle(symbol: record.bank == nil ? "doc.text" : "building.columns", size: 36)
             case .added:
                 IconCircle(symbol: "tray.and.arrow.down", size: 36)
             case .removed:
@@ -78,12 +80,17 @@ struct ActivityEntry: View {
         case .charge:
             text = "Undoing takes the \(record.amount.usd) charge off \(record.title)."
         case .adjustment, .statement:
-            text = "Undoing puts \(record.title) back to the balance it had before this."
+            text = record.bank.map { "This came from \($0) through Connected mode. " } ?? ""
+            text += "Undoing puts \(record.title) back to the balance it had before this."
+            if let note = record.note, record.termsBefore != nil { text += " It also changed: \(note). Those go back too." }
+            if record.bank != nil { text += " While \(record.title) follows its bank, the next update brings the bank’s figures back." }
         default:
             text = "Undoing puts \(record.title) back to how it was before this payment: the balance, and the due date it counted toward."
         }
         if later { text += " Later \(record.title) entries are kept and applied again." }
-        if store.editBlocker(record) == nil { text += " Edit changes the amount or the day instead." }
+        if store.editBlocker(record) == nil {
+            text += record.isSigned ? " Edit changes the balance it set, or the day, instead." : " Edit changes the amount or the day instead."
+        }
         return text
     }
 
@@ -111,29 +118,55 @@ struct ActivityEntry: View {
     }
 }
 
-/// Changes the amount or the day of a payment or a charge.
+/// Changes an entry. For a payment or a charge that is its amount or its day; for a balance update
+/// or a statement check-in it is the balance the entry set, the interest it reported, or its day.
 struct EntryEditor: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     let record: PaymentRecord
     @State private var amount = 0.0
+    @State private var interest: Double?
     @State private var date = AppClock.today
     @State private var loaded = false
     @FocusState private var focused: Bool
 
     private var earliest: Date { store.debt(record.debtID)?.addedAt ?? record.date }
-    private var changed: Bool { amount.cents != record.amount.cents || Cal.startOfDay(date) != record.date }
+    /// What the entry holds now: the amount paid or charged, or the balance it left.
+    private var current: Double { record.isSigned ? (record.balanceAfter ?? store.debt(record.debtID)?.balance ?? 0) : record.amount }
+
+    private var changed: Bool {
+        amount.cents != current.cents || Cal.startOfDay(date) != record.date
+            || (record.kind == .statement && (interest ?? 0).cents != (record.interest ?? 0).cents)
+    }
+
+    private var amountTitle: String {
+        switch record.kind {
+        case .statement: record.bank == nil ? "Statement balance" : "Balance from the bank"
+        case .adjustment: "Balance"
+        default: "Amount"
+        }
+    }
+
+    private var footer: String {
+        if record.isSigned {
+            return "This entry set the balance of \(record.title). Change the figure and the difference from the balance before it is worked out again; every later entry is then applied again on top, in date order."
+        }
+        return "\(record.title) is put back to how it was before this entry, then this and every later entry is applied again in date order. What the entry counted as (a minimum, a partial payment, an extra) is worked out again, so it can change."
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    MoneyField(title: "Amount", value: $amount)
+                    MoneyField(title: amountTitle, value: $amount)
+                    if record.kind == .statement {
+                        OptionalMoneyField(title: "Interest charged", value: $interest)
+                    }
                     DatePicker("Day", selection: $date, in: min(earliest, record.date)...store.today, displayedComponents: .date)
                 } header: {
                     Text(record.label)
                 } footer: {
-                    Text("\(record.title) is put back to how it was before this entry, then this and every later entry is applied again in date order. What the entry counted as (a minimum, a partial payment, an extra) is worked out again, so it can change.")
+                    Text(footer)
                 }
             }
             .focused($focused)
@@ -146,11 +179,16 @@ struct EntryEditor: View {
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Save") {
-                        store.edit(record.id, amount: amount, date: date)
+                        if record.isSigned {
+                            store.edit(record.id, balance: amount, interest: interest, date: date)
+                        } else {
+                            store.edit(record.id, amount: amount, date: date)
+                        }
                         dismiss()
                     }
                     .fontWeight(.semibold)
-                    .disabled(!changed || amount <= 0)
+                    // A payment or a charge of nothing is not an entry; a balance of $0.00 is a real balance.
+                    .disabled(!changed || (!record.isSigned && amount <= 0))
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
@@ -162,7 +200,8 @@ struct EntryEditor: View {
         .onAppear {
             guard !loaded else { return }
             loaded = true
-            amount = record.amount
+            amount = current
+            interest = record.interest
             date = record.date
         }
     }

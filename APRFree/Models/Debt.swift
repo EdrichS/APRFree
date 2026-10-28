@@ -225,7 +225,8 @@ extension Debt {
         var metDue: Date?
     }
 
-    /// Applies a payment by the rules above. `ignoringLock` is for projections that assume each
+    /// Applies a payment by the rules above. `ignoringLock` is for a payment that is known to be a
+    /// scheduled one: a line of a paycheck split marked paid, or a projection that assumes each
     /// scheduled payment is made in its own cycle.
     @discardableResult
     mutating func pay(_ requested: Double, on today: Date, ignoringLock: Bool = false) -> Payment {
@@ -283,6 +284,15 @@ extension Debt {
         paidThrough = Cal.date(inMonthOf: next, monthOffset: -1, day: dueDay)
         paidTowardDue = nil
         interestTowardDue = nil
+    }
+
+    /// Changes the day of the month a card or loan is due on and keeps it on the cycle it is on: the
+    /// due date already met moves to the new day in its own month, so the next one is a month after.
+    mutating func moveDueDay(to day: Int) {
+        let day = min(max(1, day), 31)
+        guard kind != .payLater, day != dueDay else { return }
+        if let through = paidThrough { paidThrough = Cal.date(inMonthOf: through, monthOffset: 0, day: day) }
+        dueDay = day
     }
 
     /// The next due date whose minimum has not been met. In the past when overdue.
@@ -406,13 +416,22 @@ extension Debt {
             startingBalance = (startingBalance + record.amount).cents
         case .adjustment, .statement:
             let wasPaidOff = isPaidOff
+            let rise = (max(0, balance + record.amount) - balance).cents
             balance = max(0, balance + record.amount).cents
             if wasPaidOff && !isPaidOff { restartCycle(today: Cal.startOfDay(record.date)) }
-            if kind == .card { startingBalance = max(startingBalance, balance) }
+            if kind == .card {
+                // What a statement adds is new debt, like a charge, so it does not count against what
+                // has been paid. A correction made by hand only ever raises the starting point to match.
+                startingBalance = record.kind == .statement && rise > 0 ? (startingBalance + rise).cents : max(startingBalance, balance)
+            }
             if record.kind == .statement { statementThrough = max(statementThrough ?? record.date, record.date) }
+            // A bank update that moved the due day also moved the cycle onto it.
+            if record.termsBefore != nil, kind != .payLater, let through = paidThrough {
+                paidThrough = Cal.date(inMonthOf: through, monthOffset: 0, day: dueDay)
+            }
             r.amount = (balance - (r.before?.balance ?? balance)).cents
         case .minimum, .installment, .payment, .partial, .extra:
-            let result = pay(record.amount, on: Cal.startOfDay(record.date))
+            let result = pay(record.amount, on: Cal.startOfDay(record.date), ignoringLock: record.scheduled == true)
             guard result.amount > 0 else { return nil }
             r.amount = result.amount
             r.kind = result.kind
@@ -421,6 +440,26 @@ extension Debt {
         paidOffAt = isPaidOff ? (paidOffAt ?? Cal.startOfDay(record.date)) : nil
         r.balanceAfter = balance
         return r
+    }
+}
+
+/// The terms of a debt that a bank can report and a bank update can change.
+struct DebtTerms: Codable, Hashable {
+    var apr: Double
+    var minimum: Double
+    var dueDay: Int
+    var creditLimit: Double?
+}
+
+extension Debt {
+    var terms: DebtTerms {
+        get { DebtTerms(apr: apr, minimum: minimum, dueDay: dueDay, creditLimit: creditLimit) }
+        set {
+            apr = newValue.apr
+            minimum = newValue.minimum
+            dueDay = newValue.dueDay
+            creditLimit = newValue.creditLimit
+        }
     }
 }
 
@@ -462,6 +501,15 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
     var debtKind: DebtKind?
     /// For a "deleted" entry: the debt as it was, so the deletion can be undone.
     var removed: Debt?
+    /// True for a payment marked paid as a scheduled line of a paycheck split. It counts toward its
+    /// due date even inside the nine-day wait, and keeps doing so when entries are applied again.
+    var scheduled: Bool?
+    /// The bank an entry came from, for one that arrived through Connected mode.
+    var bank: String?
+    /// What else the entry changed besides the balance, in words: "APR 24.99% to 26.24%".
+    var note: String?
+    /// The debt's terms just before a bank update changed them, so undoing the entry puts them back.
+    var termsBefore: DebtTerms?
 
     /// True for money paid toward the debt, as opposed to charges and bookkeeping entries.
     var isPayment: Bool {
@@ -474,11 +522,12 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
     /// Entries whose amount can go either way, so it is shown with its sign.
     var isSigned: Bool { kind == .adjustment || kind == .statement }
 
-    /// Entries whose amount or date can be changed afterwards.
+    /// Entries that can be changed afterwards: the amount or the day of a payment or a charge, and
+    /// the balance or the day of a balance change or a statement check-in.
     var isEditable: Bool {
         switch kind {
-        case .minimum, .installment, .payment, .partial, .extra, .charge: true
-        case .adjustment, .statement, .added, .removed: false
+        case .minimum, .installment, .payment, .partial, .extra, .charge, .adjustment, .statement: true
+        case .added, .removed: false
         }
     }
 
@@ -492,7 +541,7 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
         case .extra: "Extra payment"
         case .charge: "Charge added"
         case .adjustment: "Balance updated"
-        case .statement: "Statement check-in"
+        case .statement: bank == nil ? "Statement check-in" : "Bank update"
         case .added: "Added"
         case .removed: "Deleted"
         }
@@ -507,7 +556,7 @@ struct PaymentRecord: Identifiable, Codable, Hashable {
         case .extra: "\(title) extra payment"
         case .charge: "\(title) charge added"
         case .adjustment: "\(title) balance updated"
-        case .statement: "\(title) statement check-in"
+        case .statement: bank == nil ? "\(title) statement check-in" : "\(title) bank update"
         case .added: "\(title) added"
         case .removed: "\(title) deleted"
         }

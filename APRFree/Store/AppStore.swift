@@ -14,6 +14,8 @@ final class AppStore {
     /// redraw when it moves on.
     private var day = AppClock.today
 
+    /// What Connected mode talks to. Nil when this build has no bank service, and then the mode is not shown.
+    @ObservationIgnored var bank: BankService?
     @ObservationIgnored private let persists: Bool
     @ObservationIgnored private var planCache: PlanResult?
     /// True when a saved file exists but could not be read at launch. Nothing is saved until it has been.
@@ -31,6 +33,21 @@ final class AppStore {
     /// The store the app runs on. `-demo` loads the sample debts without touching saved data;
     /// in debug builds `-seedDemo` saves them as the real data.
     static func launch() -> AppStore {
+        let store = load()
+        store.bank = Connected.service(for: store)
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-connected") {
+            // Turns Connected mode on with the first two sample banks signed in, for screenshots.
+            Task { @MainActor in
+                store.turnOnConnected()
+                for name in await store.banksToOffer().prefix(2) { try? await store.connectBank(name) }
+            }
+        }
+        #endif
+        return store
+    }
+
+    private static func load() -> AppStore {
         let args = ProcessInfo.processInfo.arguments
         if args.contains("-demo") {
             // The sample debts are dated around Oct 4, 2026, so the clock is pinned there.
@@ -320,7 +337,7 @@ final class AppStore {
     }
 
     /// Several changes recorded as a single step.
-    private func transaction(_ label: String, _ body: () -> Void) {
+    func transaction(_ label: String, _ body: () -> Void) {
         guard !inTransaction else { return body() }
         let before = data
         inTransaction = true
@@ -410,14 +427,18 @@ final class AppStore {
 
     /// Records a payment. Whether it counts toward the due date, and whether that moves the date,
     /// is decided by `Debt.pay`; anything beyond what is owed is ignored.
-    func pay(_ id: UUID, amount requested: Double) {
+    ///
+    /// `scheduled` is for a payment that is known to be the scheduled one, such as a minimum ticked
+    /// off in a paycheck split. It counts toward its due date even inside the nine-day wait, where a
+    /// payment made on its own would be extra.
+    func pay(_ id: UUID, amount requested: Double, scheduled: Bool = false) {
         guard requested > 0, let before = debt(id), !before.isPaidOff else { return }
         var finished: Debt?
         update("\(before.title) payment") { data in
             guard let i = data.debts.firstIndex(where: { $0.id == id }) else { return }
             var d = data.debts[i]
             let before = d.state
-            let result = d.pay(requested, on: today)
+            let result = d.pay(requested, on: today, ignoringLock: scheduled)
             guard result.amount > 0 else { return }
             if d.isPaidOff {
                 d.paidOffAt = today
@@ -426,7 +447,7 @@ final class AppStore {
             data.debts[i] = d
             data.payments.append(PaymentRecord(debtID: id, title: d.shortTitle, date: today, amount: result.amount, kind: result.kind,
                                                interest: result.interest > 0 ? result.interest : nil, balanceAfter: d.balance,
-                                               before: before, debtKind: d.kind))
+                                               before: before, debtKind: d.kind, scheduled: scheduled ? true : nil))
         }
         if let finished { celebration = finished }
     }
@@ -437,7 +458,8 @@ final class AppStore {
         let lines = split.lines.filter { paid.contains($0.id) }
         guard !lines.isEmpty else { return }
         transaction(split.isExtraMoney ? "Extra money" : "Payday split") {
-            for line in lines { pay(line.debtID, amount: line.amount) }
+            // A scheduled line was ticked off as that payment, so it counts toward its due date.
+            for line in lines { pay(line.debtID, amount: line.amount, scheduled: !line.isExtra) }
             guard !split.isExtraMoney, lines.count == split.lines.count else { return }
             updateSettings { settings in
                 if settings.useFixedAmount {
@@ -497,10 +519,7 @@ final class AppStore {
 
     /// The cards with a balance that have not been checked against a statement this month. Loans
     /// are not waited for: the app works out their interest itself, payment by payment.
-    var awaitingCheckIn: [Debt] {
-        let month = Cal.monthStart(today)
-        return active.filter { $0.kind == .card && ($0.statementThrough.map { Cal.monthStart($0) < month } ?? true) }
-    }
+    var awaitingCheckIn: [Debt] { data.awaitingCheckIn(today: today) }
 
     /// Everything a statement check-in can cover: every card, including one at zero that may have a
     /// new balance, and every loan still being paid.
@@ -571,37 +590,70 @@ final class AppStore {
             let mine = data.payments.filter { $0.debtID == record.debtID }
             guard let position = mine.firstIndex(where: { $0.id == id }) else { return }
             AppStore.rewrite(&data, debtID: record.debtID, from: position, with: Array(mine.dropFirst(position + 1)))
+            // A bank update may also have changed the rate, the minimum, the due day or the limit.
+            if let terms = record.termsBefore, let i = data.debts.firstIndex(where: { $0.id == record.debtID }) {
+                data.debts[i].terms = terms
+            }
         }
         if celebration?.id == record.debtID { celebration = nil }
     }
 
     /// Why an entry cannot be changed, or nil when it can.
     func editBlocker(_ record: PaymentRecord) -> String? {
-        if !record.isEditable { return "Only payments and charges can be changed." }
+        if !record.isEditable { return "This marks when \(record.title) was \(record.kind == .removed ? "deleted" : "added"), so there is nothing in it to change." }
         if debt(record.debtID) == nil { return "\(record.title) has been deleted, so its entries can no longer be changed." }
         return nil
     }
 
-    /// Changes an entry's amount or day. The debt is put back to how it stood before the earliest
-    /// entry this touches, and everything from there on is applied again in date order.
+    /// Changes a payment's or a charge's amount or day. The debt is put back to how it stood before
+    /// the earliest entry this touches, and everything from there on is applied again in date order.
     func edit(_ id: UUID, amount: Double, date: Date) {
-        guard let record = data.payments.first(where: { $0.id == id }), editBlocker(record) == nil,
+        guard let record = data.payments.first(where: { $0.id == id }), !record.isSigned, editBlocker(record) == nil,
               let debt = debt(record.debtID) else { return }
         let amount = Limits.money(amount).cents
         let day = min(max(Cal.startOfDay(date), debt.addedAt), today)
         guard amount > 0, amount != record.amount || day != record.date else { return }
         update("Edit \(record.label)") { (data: inout AppData) in
-            let mine: [PaymentRecord] = data.payments.filter { $0.debtID == record.debtID }
-            guard let position = mine.firstIndex(where: { $0.id == id }) else { return }
-            var changed = mine
-            changed[position].amount = amount
-            changed[position].date = day
-            // A new day can move the entry past its neighbours. Entries keep their order within a day.
-            let sorted: [PaymentRecord] = AppStore.inDateOrder(changed)
-            let moved: Int? = mine.indices.first { mine[$0].id != sorted[$0].id }
-            let first: Int = min(position, moved ?? position)
-            AppStore.rewrite(&data, debtID: record.debtID, from: first, with: Array(sorted.dropFirst(first)))
+            AppStore.replace(&data, entry: record) { entry in
+                entry.amount = amount
+                entry.date = day
+            }
         }
+    }
+
+    /// Changes a balance update or a statement check-in: the balance it set, the interest a check-in
+    /// reported, or the day. Everything recorded after it for that debt is applied again on top.
+    func edit(_ id: UUID, balance: Double, interest: Double?, date: Date) {
+        guard let record = data.payments.first(where: { $0.id == id }), record.isSigned, editBlocker(record) == nil,
+              let debt = debt(record.debtID) else { return }
+        let balance = Limits.money(balance).cents
+        let day = min(max(Cal.startOfDay(date), debt.addedAt), today)
+        let interest = record.kind == .statement ? interest.flatMap { $0 > 0.004 ? Limits.money($0).cents : nil } : record.interest
+        guard balance != record.balanceAfter || day != record.date || interest != record.interest else { return }
+        update("Edit \(record.label)") { (data: inout AppData) in
+            AppStore.replace(&data, entry: record, setting: balance) { entry in
+                entry.date = day
+                entry.interest = interest
+            }
+        }
+        if celebration?.id == record.debtID { celebration = nil }
+    }
+
+    /// Rewrites one entry of a debt and applies it, and everything after it, again. `balance` is for
+    /// an entry that sets the balance rather than moving it: its amount becomes whatever gets there.
+    private static func replace(_ data: inout AppData, entry record: PaymentRecord, setting balance: Double? = nil,
+                                _ change: (inout PaymentRecord) -> Void) {
+        let mine: [PaymentRecord] = data.payments.filter { $0.debtID == record.debtID }
+        guard let position = mine.firstIndex(where: { $0.id == record.id }) else { return }
+        var changed = mine
+        change(&changed[position])
+        // A new day can move the entry past its neighbours. Entries keep their order within a day.
+        let sorted: [PaymentRecord] = AppStore.inDateOrder(changed)
+        let moved: Int? = mine.indices.first { mine[$0].id != sorted[$0].id }
+        let first: Int = min(position, moved ?? position)
+        var targets: [UUID: Double] = [:]
+        if let balance { targets[record.id] = balance }
+        AppStore.rewrite(&data, debtID: record.debtID, from: first, with: Array(sorted.dropFirst(first)), setting: targets)
     }
 
     /// Entries oldest first. Ones on the same day keep the order they were in.
@@ -615,8 +667,9 @@ final class AppStore {
 
     /// Puts a debt back to how it stood before its entry number `position`, then applies `entries`
     /// in its place and after it. An entry that no longer does anything (a payment on a debt that is
-    /// now already cleared) is dropped.
-    private static func rewrite(_ data: inout AppData, debtID: UUID, from position: Int, with entries: [PaymentRecord]) {
+    /// now already cleared) is dropped. `targets` names entries that set the balance to a figure.
+    private static func rewrite(_ data: inout AppData, debtID: UUID, from position: Int, with entries: [PaymentRecord],
+                                setting targets: [UUID: Double] = [:]) {
         guard let di = data.debts.firstIndex(where: { $0.id == debtID }) else { return }
         let slots = data.payments.indices.filter { data.payments[$0].debtID == debtID }
         guard position < slots.count else { return }
@@ -628,7 +681,12 @@ final class AppStore {
             if let before = record.before { d.state = before } else { d.reverse(record) }
         }
         var replayed = Array(slots[..<position].map { data.payments[$0] })
-        for entry in entries {
+        for var entry in entries {
+            if let target = targets[entry.id] {
+                entry.amount = (target - d.balance).cents
+                // A balance update that no longer changes anything has nothing left to say.
+                if entry.kind == .adjustment, abs(entry.amount) < 0.005 { continue }
+            }
             if let again = d.reapply(entry) { replayed.append(again) }
         }
         // The debt's entries go back into the places they held among everyone else's.
@@ -650,6 +708,8 @@ final class AppStore {
                 incoming.settings.acceptedLegalVersion = data.settings.acceptedLegalVersion
             }
             incoming.settings.onboarded = true
+            // Bank sign-ins belong to this iPhone, not to the backup.
+            incoming.settings.connected = data.settings.connected
             data = incoming
         }
         rollPaydays()
@@ -669,6 +729,11 @@ final class AppStore {
 
     /// Erases every debt, payment and setting, and goes back to the first-run setup.
     func reset() {
+        // "Everything" includes the bank sign-ins: the server is told to forget each one.
+        if let bank {
+            let items = settings.connected.connections.filter { $0.status != .disconnected }.map(\.itemID)
+            Task { for item in items { try? await bank.disconnect(itemID: item) } }
+        }
         celebration = nil
         UserDefaults.standard.removeObject(forKey: "progressScope")
         journal = Journal()

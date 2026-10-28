@@ -63,6 +63,10 @@ struct HomeView: View {
                 Button("Income", systemImage: "banknote") { route = .income }
                 Button("Extra Money", systemImage: "plus.circle") { route = .extraMoney }
                 Button("Export", systemImage: "square.and.arrow.up") { route = .export }
+                // Only in a build that has a bank service behind it.
+                if store.connectedAvailable {
+                    Button("Connected", systemImage: "link") { route = .connected }
+                }
                 Divider()
                 Button("Settings", systemImage: "gearshape") { route = .settings }
             } label: {

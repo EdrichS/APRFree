@@ -2009,6 +2009,387 @@ struct EngineTests {
         #expect(finishedCount > 80)                        // most of them are plans that work, so the comparison means something
     }
 
+    // MARK: October 6, second round
+
+    @Test func aMinimumTickedOffInsideTheNineDayWaitStillCounts() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase")
+        // Paid monthly on the 10th: one paycheck has to cover Chase's October 9 and November 9 due dates.
+        store.updateSettings {
+            $0.incomes = [Income(amount: 1300, frequency: .monthly, nextPayday: Cal.date(2026, 10, 10), monthDays: [10])]
+            $0.buffer = 0
+        }
+        // $1,300.00 covers everything due before November 10 and leaves a little extra, which goes to Chase.
+        let split = PayoffEngine.split(amount: 1300, debts: store.data.debts, settings: store.settings, today: today)
+        #expect(split.shortBy == 0 && split.lines.contains { $0.isExtra && $0.debtID == chase.id })
+        let scheduled = split.lines.filter { $0.debtID == chase.id && !$0.isExtra }
+        #expect(scheduled.map(\.dueDate) == [Cal.date(2026, 10, 9), Cal.date(2026, 11, 9)])
+        // The second one falls inside the nine days after the first is met, and the split says so.
+        #expect(scheduled.last?.detail.contains("pay from Oct 18") == true)
+
+        store.apply(split, paid: Set(split.lines.map(\.id)))
+        let minimums = store.activity(for: chase.id).filter { $0.date == today && $0.kind == .minimum }
+        // Both were ticked off as minimums, so both count: neither is recorded as an extra payment.
+        #expect(minimums.count == 2)
+        #expect(minimums.allSatisfy { $0.scheduled == true && $0.amount == 35 })
+        #expect(store.debt(chase.id)?.paidThrough == Cal.date(2026, 11, 9))
+        #expect(store.debt(chase.id)?.nextUnpaidDue() == Cal.date(2026, 12, 9))
+
+        // Taking the first one back leaves the other still counting as a minimum, now for October 9.
+        store.undo(try #require(minimums.last).id)
+        let left = store.activity(for: chase.id).filter { $0.date == today && $0.kind == .minimum }
+        #expect(left.count == 1)
+        #expect(store.debt(chase.id)?.nextUnpaidDue() == Cal.date(2026, 11, 9))
+
+        // A payment made on its own inside the wait is still what it was before: extra.
+        let alone = AppStore(data: demo, persists: false)
+        alone.pay(chase.id, amount: 35)
+        alone.pay(chase.id, amount: 35)
+        #expect(alone.activity(for: chase.id).prefix(2).map(\.kind) == [.extra, .minimum])
+        #expect(alone.debt(chase.id)?.nextUnpaidDue() == Cal.date(2026, 11, 9))
+    }
+
+    @Test func balanceChangesAndCheckInsCanBeEdited() throws {
+        let store = AppStore(data: demo, persists: false)
+        let chase = try debt("Chase")
+        store.checkIn([.init(debtID: chase.id, balance: 1268.40, minimum: nil, interest: 27.90)])
+        store.pay(chase.id, amount: 35)
+        #expect(store.debt(chase.id)?.balance == 1233.40)
+        let checkIn = try #require(store.activity(for: chase.id).first { $0.kind == .statement })
+        #expect(store.editBlocker(checkIn) == nil)
+
+        // The statement actually said $1,280.00, with $30.00 of interest.
+        store.edit(checkIn.id, balance: 1280, interest: 30, date: today)
+        var entry = try #require(store.activity(for: chase.id).first { $0.kind == .statement })
+        #expect(entry.amount == 39.50 && entry.balanceAfter == 1280 && entry.interest == 30)
+        // The payment after it is applied again on top, and is still the minimum it was.
+        #expect(store.debt(chase.id)?.balance == 1245)
+        #expect(store.activity(for: chase.id).first?.kind == .minimum)
+        #expect(store.debt(chase.id)?.startingBalance == chase.startingBalance + 39.50)
+        #expect(store.undoLabel == "Edit Chase statement check-in")
+        // October's statement shows the new figure, on top of the interest in the loan payment already made.
+        let loanInterest = try #require(AppStore(data: demo, persists: false).statement(for: today)).interest
+        #expect(store.statement(for: today)?.interest == (loanInterest + 30).cents)
+        store.undoLast()
+        #expect(store.debt(chase.id)?.balance == 1233.40)
+        store.redo()
+
+        // Its day can change too. Moved to October 2 it is still this month's check-in.
+        store.edit(checkIn.id, balance: 1280, interest: 30, date: Cal.date(2026, 10, 2))
+        entry = try #require(store.activity(for: chase.id).first { $0.kind == .statement })
+        #expect(entry.date == Cal.date(2026, 10, 2) && entry.balanceAfter == 1280)
+        #expect(store.debt(chase.id)?.balance == 1245)
+        #expect(!store.awaitingCheckIn.contains { $0.id == chase.id })
+        // The wrong kind of edit does nothing: a check-in has no "amount" to change.
+        store.edit(checkIn.id, amount: 5, date: today)
+        #expect(store.debt(chase.id)?.balance == 1245)
+
+        // A balance corrected by hand can be corrected again.
+        var amex = try debt("American Express")
+        amex.balance = 800
+        store.save(amex)
+        let change = try #require(store.activity(for: amex.id).first)
+        #expect(change.kind == .adjustment && change.amount == 39.80)
+        store.edit(change.id, balance: 790, interest: nil, date: today)
+        #expect(store.debt(amex.id)?.balance == 790)
+        #expect(store.activity(for: amex.id).first?.amount == 29.80)
+        // $0.00 is a real balance: the card is then paid off.
+        store.edit(change.id, balance: 0, interest: nil, date: today)
+        #expect(store.debt(amex.id)?.isPaidOff == true)
+        #expect(store.debt(amex.id)?.paidOffAt == today)
+        // Set back to what it was before the change, the entry has nothing left to say and goes.
+        let entries = store.activity(for: amex.id).count
+        store.edit(change.id, balance: 760.20, interest: nil, date: today)
+        #expect(store.debt(amex.id)?.balance == 760.20)
+        #expect(store.activity(for: amex.id).count == entries - 1)
+        // Only the entries that mark a debt being added or deleted cannot be changed.
+        #expect(store.editBlocker(try #require(store.activity(for: chase.id).last)) != nil)
+    }
+
+    @Test func insightsUseRecordedInterestOnceAMonthHasACheckIn() throws {
+        let store = AppStore(data: demo, persists: false)
+        let september = Cal.date(2026, 9, 1)
+        // No check-in in September: Insights estimates, and its figure is more than the statement recorded.
+        let estimate = store.interest(inMonth: september)
+        let recorded = try #require(store.statement(for: september)).interest
+        #expect(!estimate.isRecorded)
+        #expect(estimate.amount > recorded)
+
+        // Check Chase in, then say that statement was dated September 28.
+        let chase = try debt("Chase")
+        store.checkIn([.init(debtID: chase.id, balance: 1268.40, minimum: nil, interest: 27.90)])
+        let entry = try #require(store.activity(for: chase.id).first)
+        store.edit(entry.id, balance: 1268.40, interest: 27.90, date: Cal.date(2026, 9, 28))
+        let statement = try #require(store.statement(for: september))
+        #expect(statement.hasCheckIn)
+        #expect(statement.interest == (recorded + 27.90).cents)
+        // Now the two screens show the same number.
+        let after = store.interest(inMonth: september)
+        #expect(after.isRecorded)
+        #expect(after.amount == statement.interest)
+        // Every statement adds up: start, less paid, plus charges, interest and anything else, is the end.
+        for month in store.statements {
+            #expect((month.opening - month.paid + month.charged + month.interest + month.other).cents == month.closing)
+        }
+    }
+
+    @Test func theCheckInReminderComesOnceAMonth() throws {
+        var data = demo
+        #expect(!PlanSettings().remindCheckIn && PlanSettings().checkInDay == 1)       // off unless turned on
+        data.settings.checkInDay = 31
+        var reminders = Reminders.checkIns(for: data, today: today)
+        // The last day of each month, however long it is.
+        #expect(reminders.map(\.day) == [Day(2026, 10, 31), Day(2026, 11, 30), Day(2026, 12, 31)])
+        #expect(reminders.first?.body.contains("5 cards") == true)
+
+        // Once every card has been checked in this month, this month's reminder is dropped.
+        let store = AppStore(data: data, persists: false)
+        store.checkIn(store.awaitingCheckIn.map { .init(debtID: $0.id, balance: $0.balance, minimum: nil, interest: nil) })
+        reminders = Reminders.checkIns(for: store.data, today: today)
+        #expect(reminders.map(\.day) == [Day(2026, 11, 30), Day(2026, 12, 31)])
+
+        // With one card it is named; with no card left to pay there is nothing to remind about.
+        data.debts.removeAll { $0.kind == .card && $0.title != "Chase" }
+        #expect(Reminders.checkIns(for: data, today: today).first?.body.contains("Chase statement") == true)
+        data.debts.removeAll { $0.kind == .card }
+        #expect(Reminders.checkIns(for: data, today: today).isEmpty)
+        // The day survives a round trip and a damaged file.
+        data.settings.checkInDay = 99
+        data.settings.remindCheckIn = true
+        let back = try Persistence.read(Persistence.contents(of: data))
+        #expect(back.settings.remindCheckIn && back.settings.checkInDay == 31)
+    }
+
+    @Test func utilizationIsKeptMonthByMonth() throws {
+        let store = AppStore(data: demo, persists: false)
+        let months = store.utilizationMonths
+        #expect(months.map { Fmt.monthNameYear($0.month) }
+                == ["March 2026", "April 2026", "May 2026", "June 2026", "July 2026", "August 2026", "September 2026", "October 2026"])
+        #expect(months.first?.change == nil)
+        #expect(months.last?.isCurrent == true)
+        #expect(months.last?.share == store.utilization)
+        // Each month's change is measured from the month before it.
+        for (earlier, later) in zip(months, months.dropFirst()) {
+            #expect(abs(try #require(later.change) - (later.share - earlier.share)) < 1e-12)
+        }
+        // Six months of minimums and no new charges: down every month from April to September.
+        #expect(months[1...6].allSatisfy { ($0.change ?? 0) < 0 })
+        // Each month the five minimums ($247.00) came off $19,500.00 of limits.
+        #expect(abs(try #require(months[3].change) + 247.0 / 19500) < 1e-9)
+        #expect(months.last?.change == 0)                   // nothing paid on a card yet in October
+        // $8,774.75 owed; 30% of $19,500.00 is $5,850.00.
+        #expect(store.toReachThirtyPercent == 2924.75)
+        #expect(store.creditLimit == 19500)
+        let chase = try debt("Chase")
+        #expect(store.utilization(of: chase, on: Cal.date(2026, 8, 31)) == 1275.50 / 3000)
+        #expect(store.utilization(of: chase, on: Cal.date(2026, 9, 30)) == 1240.50 / 3000)
+        // A charge moves this month up, and the month list follows.
+        store.charge(chase.id, amount: 300)
+        #expect(abs(try #require(store.utilizationMonths.last?.change) - 300.0 / 19500) < 1e-9)
+    }
+
+    // MARK: Connected mode
+
+    @MainActor @Test func connectedModeIsOffUntilItIsTurnedOn() async throws {
+        #expect(!AppData.empty(today: today).settings.connected.isOn)
+        #expect(!demo.settings.connected.isOn && demo.settings.connected.connections.isEmpty)
+        // A build with no bank service shows nothing of the mode and cannot turn it on.
+        let bare = AppStore(data: demo, persists: false)
+        #expect(!bare.connectedAvailable)
+        bare.turnOnConnected()
+        #expect(!bare.connected.isOn && !bare.connectedOn)
+
+        let store = AppStore(data: demo, persists: false)
+        store.bank = SampleBank(data: { store.data }, today: { DemoData.today })
+        #expect(store.connectedAvailable && !store.connectedOn)
+        // With the mode off nothing connects, updates or changes.
+        try await store.connectBank("Chase")
+        #expect(store.connected.connections.isEmpty)
+        #expect(await store.refreshBanks().entries == 0)
+        #expect(store.applyBankFigures() == 0)
+        #expect(store.data.payments == demo.payments)
+
+        store.turnOnConnected()
+        #expect(store.connectedOn)
+        #expect(store.connected.acceptedVersion == Connected.termsVersion && store.connected.acceptedAt != nil)
+        // The sample bank offers the lenders of the cards and loans that name one.
+        #expect(await store.banksToOffer() == ["Chase", "Capital One", "Bank of America", "Citi", "American Express", "Federal · Dept. of Education"])
+        // Turning it on is not something Undo takes back.
+        #expect(store.undoLabel == nil)
+    }
+
+    @MainActor @Test func bankFiguresArriveAsEntriesAndOnlyAfterAChoice() async throws {
+        let store = AppStore(data: demo, persists: false)
+        let bank = SampleBank(data: { store.data }, today: { DemoData.today })
+        store.bank = bank
+        store.turnOnConnected()
+        let chase = try debt("Chase")
+
+        try await store.connectBank("Chase")
+        var connection = try #require(store.connected.connections.first)
+        var account = try #require(connection.accounts.first)
+        #expect(connection.institution == "Chase" && connection.status == .connected && connection.lastUpdate != nil)
+        #expect(account.debtID == chase.id && account.source == .undecided && account.isOn)
+        #expect(account.name == "Freedom Unlimited" && account.mask?.count == 4)
+        // The bank has charged a month of interest the app has not seen: $1,240.50 at 26.99% is $27.90.
+        #expect(account.figures?.balance == 1268.40)
+        // Nothing changes until the user has chosen. Both figures are shown.
+        #expect(store.debt(chase.id) == chase)
+        var questions = store.bankQuestions
+        #expect(questions.count == 1)
+        #expect(questions.first?.differences == [BankDifference(field: "Balance", mine: "$1,240.50", bank: "$1,268.40")])
+        let update = await store.refreshBanks()
+        #expect(update.entries == 0 && update.waiting == 1)
+        #expect(store.debt(chase.id) == chase)
+        #expect(store.undoLabel == nil)
+
+        // "Keep mine": the question goes away and the debt stays as it is.
+        store.follow(.mine, account: account.id, in: connection.id)
+        #expect(store.bankQuestions.isEmpty)
+        #expect(store.debt(chase.id) == chase)
+        #expect(await store.refreshBanks().entries == 0)
+        #expect(store.awaitingCheckIn.contains { $0.id == chase.id })          // still checked in by hand
+
+        // "Use the bank's": the difference arrives as one entry, like a statement check-in.
+        store.follow(.bank, account: account.id, in: connection.id)
+        let entry = try #require(store.activity(for: chase.id).first)
+        #expect(entry.kind == .statement && entry.bank == "Chase" && entry.amount == 27.90 && entry.interest == 27.90)
+        #expect(entry.label == "Chase bank update" && entry.balanceAfter == 1268.40 && entry.termsBefore == nil)
+        #expect(store.debt(chase.id)?.balance == 1268.40)
+        let loanInterest = try #require(AppStore(data: demo, persists: false).statement(for: today)).interest
+        #expect(store.statement(for: today)?.interest == (loanInterest + 27.90).cents)
+        #expect(!store.awaitingCheckIn.contains { $0.id == chase.id })         // the bank keeps it up to date now
+        #expect(store.awaitingCheckIn.count == 4)
+        // Asking again changes nothing: the bank and the app agree.
+        #expect(await store.refreshBanks().entries == 0)
+        #expect(store.activity(for: chase.id).filter { $0.bank != nil }.count == 1)
+
+        // The update is one step for Undo, and undoing it does not disconnect anything.
+        #expect(store.undoLabel == "Bank update")
+        store.undoLast()
+        #expect(store.debt(chase.id) == chase)
+        #expect(store.connected.connections.count == 1 && store.connectedOn)
+        store.redo()
+        #expect(store.debt(chase.id)?.balance == 1268.40)
+        // The entry can also be taken back on its own, or edited like any check-in.
+        store.edit(entry.id, balance: 1270, interest: 29.50, date: today)
+        #expect(store.debt(chase.id)?.balance == 1270)
+        store.undo(entry.id)
+        #expect(store.debt(chase.id)?.balance == 1240.50)
+
+        // A bank that also disagrees about the terms: every difference is listed, and the choice is one.
+        let capitalOne = try debt("Capital One")
+        bank.adjust = { debt, figures in
+            guard debt.id == capitalOne.id else { return }
+            figures.apr = 29.99
+            figures.minimum = 61
+            figures.creditLimit = 5000
+            figures.nextDue = Day(2026, 10, 14)
+        }
+        try await store.connectBank("Capital One")
+        questions = store.bankQuestions
+        #expect(questions.first { $0.debt.id == capitalOne.id }?.differences.map(\.field)
+                == ["Balance", "APR", "Minimum payment", "Due day", "Credit limit"])
+        connection = try #require(store.connected.connections.last)
+        account = try #require(connection.accounts.first)
+        store.follow(.bank, account: account.id, in: connection.id)
+        let changed = try #require(store.debt(capitalOne.id))
+        #expect(changed.apr == 29.99 && changed.minimum == 61 && changed.creditLimit == 5000 && changed.dueDay == 14)
+        #expect(changed.nextUnpaidDue() == Cal.date(2026, 10, 14))             // the same cycle, on its new day
+        let terms = try #require(store.activity(for: capitalOne.id).first)
+        #expect(terms.note == "APR 28.49% to 29.99%, minimum $58.00 to $61.00, due day 12th to 14th, limit $4,500.00 to $5,000.00")
+        #expect(terms.termsBefore == capitalOne.terms)
+        // Undoing that entry puts the terms back as well as the balance.
+        store.undo(terms.id)
+        #expect(store.debt(capitalOne.id) == capitalOne)
+
+        // A due day of the 31st is not "different" in a month that has only 30 days.
+        var late = capitalOne
+        late.dueDay = 31
+        let november = BankFigures(balance: late.balance, nextDue: Day(2026, 11, 30), asOf: Date())
+        #expect(!november.dueDayDiffers(from: late))
+        #expect(november.differences(from: late, on: today).isEmpty)
+    }
+
+    @MainActor @Test func banksCanBeDisconnectedAndStayOnThisIPhone() async throws {
+        let store = AppStore(data: demo, persists: false)
+        let bank = SampleBank(data: { store.data }, today: { DemoData.today })
+        store.bank = bank
+        store.turnOnConnected()
+        try await store.connectBank("Chase")
+        try await store.connectBank("Citi")
+        let chase = try #require(store.connected.connections.first)
+        let account = try #require(chase.accounts.first)
+        store.follow(.bank, account: account.id, in: chase.id)
+        #expect(store.connected.bankFedDebts.count == 1)
+
+        // An account can be switched off, or pointed at a different debt, which asks the question again.
+        store.setAccount(account.id, in: chase.id, isOn: false)
+        #expect(store.connected.bankFedDebts.isEmpty)
+        store.setAccount(account.id, in: chase.id, isOn: true)
+        store.link(account.id, in: chase.id, to: nil)
+        #expect(store.connected.connections.first?.accounts.first?.source == .undecided)
+        #expect(store.debts(for: account).map(\.title).contains("Chase"))
+        store.link(account.id, in: chase.id, to: try debt("Chase").id)
+        store.follow(.bank, account: account.id, in: chase.id)
+
+        // A bank that wants a new sign-in says so, and comes back once it has one.
+        bank.expired = [chase.itemID]
+        let update = await store.refreshBanks()
+        #expect(update.problems == ["Chase wants you to sign in again"])
+        #expect(store.connected.connections.first?.status == .needsSignIn)
+        #expect(store.connected.bankFedDebts.isEmpty)
+        bank.expired = []
+        await store.refreshBanks()
+        #expect(store.connected.connections.first?.status == .connected)
+
+        // Bank sign-ins are left out of a backup, and a restored backup does not remove them.
+        let backup = try Persistence.read(BackupDocument.contents(of: store.data))
+        #expect(backup.settings.connected == ConnectedState())
+        #expect(backup.payments.contains { $0.bank == "Chase" })              // the entries are the user's own
+        store.restore(demo)
+        #expect(store.connected.connections.count == 2 && store.connectedOn)
+
+        // Disconnected, a bank stays in the list as a record until it is removed.
+        try await store.disconnect(chase.id)
+        let record = try #require(store.connected.connections.first)
+        #expect(record.status == .disconnected && record.changedAt >= record.addedAt)
+        #expect(store.connected.bankFedDebts.isEmpty)
+        store.removeConnection(chase.id)
+        #expect(store.connected.connections.map(\.institution) == ["Citi"])
+        // A bank that is still connected cannot be removed, only disconnected.
+        store.removeConnection(try #require(store.connected.connections.first).id)
+        #expect(store.connected.connections.count == 1)
+
+        // Turning the mode off disconnects everything.
+        #expect(await store.turnOffConnected().isEmpty)
+        #expect(!store.connected.isOn)
+        #expect(store.connected.connections.allSatisfy { $0.status == .disconnected })
+        #expect(await store.refreshBanks().entries == 0)
+    }
+
+    // MARK: Logo
+
+    @MainActor @Test func theLogoDrawsAtEverySize() throws {
+        for size in [29.0, 40, 60, 120, 256] as [CGFloat] {
+            let mark = try #require(ImageRenderer(content: LogoMark(size: size)).uiImage)
+            #expect(mark.size == CGSize(width: size, height: size))
+        }
+        let word = try #require(ImageRenderer(content: LogoWordmark(size: 40)).uiImage)
+        // The lettering, the dot and the stroke: wider than the 170-point stroke alone, 56 points tall.
+        #expect(word.size.width >= 170 && word.size.height == 56)
+        let lockup = try #require(ImageRenderer(content: LogoLockup(height: 64)).uiImage)
+        #expect(lockup.size.height == 64 && lockup.size.width == 64 + 18 + word.size.width)
+        if let folder = ProcessInfo.processInfo.environment["APRFREE_LOGO_OUT"] {
+            // For looking at them: set APRFREE_LOGO_OUT to a folder and the pictures are written there.
+            let renderer = ImageRenderer(content: VStack(spacing: 24) { LogoLockup(height: 64); LogoWordmark(size: 40); LogoMark(size: 180) }.padding(24).background(Color.white))
+            renderer.scale = 3
+            try renderer.uiImage?.pngData()?.write(to: URL(fileURLWithPath: folder).appendingPathComponent("logo-views.png"))
+        }
+        // The app icon is there in all three appearances, and its files are the square, opaque ones the App Store asks for.
+        #expect(Logo.lettering == "APRfree")
+    }
+
     // MARK: Setup
 
     @Test func thePolicyAndDisclaimerMustBothBeAccepted() {

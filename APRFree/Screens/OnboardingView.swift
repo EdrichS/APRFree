@@ -427,9 +427,10 @@ struct OnboardingView: View {
 
     private var reminders: some View {
         VStack(spacing: 10) {
-            heading("Reminders", "Allow notifications for due dates and paydays.")
+            heading("Reminders", "Allow notifications for due dates, paydays and the monthly statement check-in.")
             sample("calendar", "\(dueExample?.debt.title ?? "Your card") is due tomorrow", dueExample?.note ?? "The day before each due date")
             sample("dollarsign", "It’s payday", "Split your paycheck with Make a Payment")
+            sample("doc.text", "Statement check-in", "Once a month: enter what your statements say")
         }
     }
 
@@ -504,6 +505,7 @@ struct OnboardingView: View {
                 $0.strategy = strategy
                 $0.remindDueDates = reminders
                 $0.remindPaydays = reminders
+                $0.remindCheckIn = reminders
                 $0.onboarded = true
             }
         }

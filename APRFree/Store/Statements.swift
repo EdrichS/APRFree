@@ -28,11 +28,14 @@ struct MonthStatement: Identifiable, Hashable {
     var charged: Double { entries.filter { $0.kind == .charge }.reduce(0) { $0 + $1.amount }.cents }
 
     /// Interest recorded this month: the interest part of loan payments, and what statement
-    /// check-ins reported or, when no figure was entered, how far they raised a balance.
+    /// check-ins and bank updates reported or, when no figure was entered, how far a check-in
+    /// raised a balance.
     var interest: Double {
         entries.reduce(0) { sum, entry in
             switch entry.kind {
-            case .statement: sum + (entry.interest ?? max(0, entry.amount))
+            // A check-in with no figure typed counts whatever it added. A bank update only counts
+            // interest the bank named, because the rest of what it added may be new purchases.
+            case .statement: sum + (entry.interest ?? (entry.bank == nil ? max(0, entry.amount) : 0))
             case .minimum, .installment, .payment, .partial, .extra: sum + (entry.interest ?? 0)
             default: sum
             }
@@ -40,6 +43,29 @@ struct MonthStatement: Identifiable, Hashable {
     }
 
     var change: Double { (closing - opening).cents }
+
+    /// What moved the balance besides payments, charges and interest: debts added or deleted,
+    /// corrections made by hand, and the part of a check-in or bank update that was not interest.
+    var other: Double { (closing - opening + paid - charged - interest).cents }
+
+    /// True once a statement check-in or a bank update was recorded in the month. From then on
+    /// the recorded interest is the figure to show for it, everywhere.
+    var hasCheckIn: Bool { entries.contains { $0.kind == .statement } }
+}
+
+extension AppData {
+    /// The cards a monthly check-in is asked for: every card with a balance, except one a bank
+    /// keeps up to date through Connected mode.
+    var checkInCards: [Debt] {
+        let fed = settings.connected.bankFedDebts
+        return debts.filter { $0.kind == .card && !$0.isPaidOff && !fed.contains($0.id) }
+    }
+
+    /// Those of them not yet checked against a statement this month.
+    func awaitingCheckIn(today: Date) -> [Debt] {
+        let month = Cal.monthStart(today)
+        return checkInCards.filter { $0.statementThrough.map { Cal.monthStart($0) < month } ?? true }
+    }
 }
 
 extension AppStore {
@@ -77,51 +103,17 @@ extension AppStore {
         statements.first { $0.month == Cal.monthStart(month) }
     }
 
-    // MARK: Credit utilization
-
-    /// Cards that have a credit limit, which is what utilization is measured against.
-    var limitedCards: [Debt] {
-        data.debts.filter { $0.kind == .card && ($0.creditLimit ?? 0) > 0 }
-    }
-
-    /// The share of the combined credit limit in use, from 0 to 1. Nil when no card has a limit.
-    var utilization: Double? {
-        let limit = limitedCards.reduce(0) { $0 + ($1.creditLimit ?? 0) }
-        return limit > 0 ? limitedCards.reduce(0) { $0 + $1.balance } / limit : nil
-    }
-
-    /// Utilization on each day a card balance changed, from the recorded entries. Measured against
-    /// today's limits, since past limits are not kept.
-    var utilizationHistory: [PlanPoint] {
-        let cards = limitedCards
-        let limit = cards.reduce(0) { $0 + ($1.creditLimit ?? 0) }
-        guard limit > 0 else { return [] }
-        let ids = Set(cards.map(\.id))
-        let tracks = History.tracks(debts: data.debts, payments: data.payments, today: today).filter { ids.contains($0.id) }
-        let days = Set(tracks.flatMap { $0.steps.map(\.day) }.filter { $0 <= today }).union([today]).sorted()
-        return days.map { day in PlanPoint(date: day, total: tracks.reduce(0) { $0 + $1.balance(on: day) } / limit) }
-    }
-
-    /// Utilization after each payday of the current plan.
-    var utilizationPlan: [PlanPoint] {
-        let cards = limitedCards
-        let limit = cards.reduce(0) { $0 + ($1.creditLimit ?? 0) }
-        let plan = plan
-        guard limit > 0, plan.finished else { return [] }
-        return plan.series.enumerated().map { index, point in
-            let owed = cards.reduce(0.0) { sum, card in
-                // A card already at zero is not in the plan at all.
-                sum + (plan.balances[card.id].flatMap { $0.indices.contains(index) ? $0[index] : nil } ?? 0)
-            }
-            return PlanPoint(date: point.date, total: owed / limit)
+    /// A month's interest, for anywhere outside its statement. Once the month has a statement
+    /// check-in this is the recorded figure, the same one the statement shows. Before that it is
+    /// an estimate of what the cards charged, plus the interest part of the loan payments.
+    func interest(inMonth month: Date) -> (amount: Double, isRecorded: Bool) {
+        let start = Cal.monthStart(month)
+        if let statement = statement(for: start), statement.hasCheckIn { return (statement.interest, true) }
+        let months = Cal.months(from: start, to: Cal.monthStart(today))
+        guard months >= 1 else { return (statement(for: start)?.interest ?? 0, false) }
+        let estimate = data.debts.reduce(0.0) { sum, debt in
+            sum + (PayoffEngine.pastSlices(debt: debt, payments: data.payments, today: today, months: months).first?.interest ?? 0)
         }
-    }
-
-    /// The day a card's balance drops under 30% of its limit on the current plan. Today if it
-    /// already is; nil if the plan never gets it there.
-    func under30Date(for card: Debt) -> Date? {
-        guard let limit = card.creditLimit, limit > 0 else { return nil }
-        if card.balance < limit * 0.3 { return today }
-        return plan.firstDate(card.id, under: limit * 0.3)
+        return (estimate.cents, false)
     }
 }

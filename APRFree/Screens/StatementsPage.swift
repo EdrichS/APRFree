@@ -1,4 +1,3 @@
-import Charts
 import SwiftUI
 
 /// The typeface for a statement's month and year.
@@ -17,8 +16,7 @@ enum StatementFont {
     }
 }
 
-/// Page 3: a statement for every month, stacked like passes from the oldest to the newest, then
-/// credit utilization over time.
+/// Page 3: a statement for every month, stacked like passes from the oldest to the newest.
 struct StatementsPage: View {
     @Environment(AppStore.self) private var store
     @Binding var route: Route?
@@ -34,8 +32,6 @@ struct StatementsPage: View {
                     } else {
                         StatementStack(statements: statements, checkIn: { checkingIn = true }) { route = .statement($0.month) }
                     }
-                    SectionHeader(title: "Credit Utilization").padding(.top, 20).id("utilization")
-                    UtilizationSection()
                 }
                 .padding(.horizontal, Theme.margin)
                 .padding(.bottom, 84)
@@ -156,6 +152,9 @@ private struct OpenStatement: View {
                         row("Paid", "−\(statement.paid.usd)", color: statement.paid > 0 ? Theme.green : .primary)
                         row("Charges added", "+\(statement.charged.usd)")
                         row("Interest recorded", "+\(statement.interest.usd)")
+                        if abs(statement.other) >= 0.005 {
+                            row("Other changes", statement.other > 0 ? "+\(statement.other.usd)" : "−\((-statement.other).usd)")
+                        }
                         row(statement.isCurrent ? "Balance today" : "Balance at the end", statement.closing.usd, bold: true)
                     }
                     .padding(.horizontal, 18)
@@ -245,6 +244,14 @@ struct StatementDetail: View {
                     TileRow(minHeight: 96) {
                         StatTile(label: "Charges added", value: statement.charged.usd, note: "new purchases")
                         StatTile(label: "Interest recorded", value: statement.interest.usd, note: "loans and check-ins")
+                    }
+                    if abs(statement.other) >= 0.005 {
+                        Text("Other changes \(statement.other > 0 ? "+\(statement.other.usd)" : "−\((-statement.other).usd)"): debts added or deleted, balances corrected by hand, and the part of a check-in or bank update that was not interest.")
+                            .font(.footnote)
+                            .monospacedDigit()
+                            .foregroundStyle(Theme.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 4)
                     }
                     if statement.isCurrent {
                         Button(store.awaitingCheckIn.isEmpty ? "Check In Again" : "Check In This Month’s Statements") { checkingIn = true }
@@ -425,153 +432,5 @@ struct StatementCheckIn: View {
                                     interest: $0.interest.flatMap { $0 > 0 ? $0 : nil })
         })
         dismiss()
-    }
-}
-
-// MARK: - Credit utilization
-
-/// How much of the credit limits is in use, over time and card by card, with the day each card
-/// drops under 30%.
-private struct UtilizationSection: View {
-    @Environment(AppStore.self) private var store
-
-    var body: some View {
-        let cards = store.limitedCards
-        if cards.isEmpty {
-            Tile {
-                TileNote(store.data.debts.contains { $0.kind == .card }
-                         ? "Add a credit limit to a card (Edit on its screen) to see how much of it is in use."
-                         : "Add a credit card with its limit to see how much of it is in use.")
-            }
-        } else {
-            chart
-            list(cards)
-            let missing = store.data.debts.filter { $0.kind == .card && ($0.creditLimit ?? 0) <= 0 }
-            if !missing.isEmpty {
-                Text("\(missing.map(\.title).formatted(.list(type: .and))) \(missing.count == 1 ? "has" : "have") no credit limit set, so \(missing.count == 1 ? "it is" : "they are") left out.")
-                    .font(.footnote)
-                    .foregroundStyle(Theme.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 4)
-            }
-        }
-    }
-
-    /// Whole percents, except close to the 30% line, where "30%" could mean either side of it.
-    private func percent(_ value: Double) -> String {
-        abs(value - 0.3) < 0.01 && abs(value - 0.3) > 0.00005 ? String(format: "%.1f%%", value * 100) : "\(Int((value * 100).rounded()))%"
-    }
-
-    private var chart: some View {
-        let history = store.utilizationHistory
-        let planned = store.utilizationPlan
-        let now = store.utilization ?? 0
-        let start = history.first?.date ?? store.today
-        let end = max(planned.last?.date ?? store.today, Cal.addMonths(1, to: store.today))
-        let top = max(0.4, ((history + planned).map(\.total).max() ?? 0) * 1.1, now * 1.1)
-        let under = planned.first { $0.total < 0.3 }?.date
-        return Tile {
-            HStack {
-                TileLabel("All cards")
-                Spacer()
-                LegendMark(text: "History", color: .primary)
-                LegendMark(text: "Plan", dashed: true, color: .primary)
-            }
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(percent(now))
-                    .font(.system(size: 34, weight: .bold))
-                    .monospacedDigit()
-                    .foregroundStyle(now < 0.3 ? Theme.green : Color.primary)
-                Text("of \(store.limitedCards.reduce(0) { $0 + ($1.creditLimit ?? 0) }.usd) in use")
-                    .font(.subheadline)
-                    .foregroundStyle(Theme.secondary)
-            }
-            .padding(.top, 2)
-            Chart {
-                ForEach(history) { point in
-                    LineMark(x: .value("Date", point.date), y: .value("In use", point.total), series: .value("Line", "History"))
-                        .interpolationMethod(.stepEnd)
-                        .foregroundStyle(Color.primary)
-                        .lineStyle(StrokeStyle(lineWidth: 2.4, lineCap: .round, lineJoin: .round))
-                }
-                ForEach(planned) { point in
-                    LineMark(x: .value("Date", point.date), y: .value("In use", point.total), series: .value("Line", "Plan"))
-                        .foregroundStyle(Color.primary)
-                        .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round, dash: [5, 5]))
-                }
-                RuleMark(y: .value("Line", 0.3))
-                    .foregroundStyle(Theme.tertiary)
-                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
-                    .annotation(position: .top, alignment: .trailing, spacing: 2) {
-                        Text("30%").font(.caption2.weight(.semibold)).foregroundStyle(Theme.secondary)
-                    }
-            }
-            .chartXScale(domain: start...end)
-            .chartYScale(domain: 0...top)
-            .chartYAxis {
-                AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) { value in
-                    AxisGridLine().foregroundStyle(Theme.separator)
-                    AxisValueLabel {
-                        if let share = value.as(Double.self) { Text(percent(share)) }
-                    }
-                }
-            }
-            .chartXAxis {
-                AxisMarks(preset: .aligned, values: .automatic(desiredCount: 4)) { value in
-                    let span = end.timeIntervalSince(start)
-                    if let date = value.as(Date.self), span > 0, (0.07...0.93).contains(date.timeIntervalSince(start) / span) {
-                        AxisValueLabel { Text(Cal.days(from: start, to: end) <= 100 ? Fmt.monthDay(date) : Fmt.monthAndShortYear(date)) }
-                    }
-                }
-            }
-            .frame(height: 150)
-            .padding(.top, 10)
-            .padding(.horizontal, 12)
-            .clipped()
-            .padding(.horizontal, -12)
-            .accessibilityLabel("Credit utilization over time. Now \(percent(now)).")
-            TileNote(summary(now: now, under: under))
-        }
-    }
-
-    private func summary(now: Double, under: Date?) -> String {
-        if now < 0.3 { return "Under 30% across your cards." }
-        if let under { return "On your plan, your cards together drop under 30% on \(Fmt.full(under))." }
-        return store.hasIncome ? "Your current plan does not bring your cards under 30%." : "Add your income to see when this drops under 30%."
-    }
-
-    private func list(_ cards: [Debt]) -> some View {
-        CardGroup {
-            ForEach(cards) { card in
-                if card.id != cards.first?.id { RowDivider() }
-                let share = card.utilization ?? 0
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(card.title).font(.callout.weight(.semibold)).lineLimit(1)
-                        Spacer(minLength: 8)
-                        Text(percent(share))
-                            .font(.callout.weight(.semibold))
-                            .monospacedDigit()
-                            .foregroundStyle(share < 0.3 ? Theme.green : Color.primary)
-                    }
-                    ProgressBar(fraction: share, color: share < 0.3 ? Theme.green : Theme.primaryFill, height: 6)
-                    Text(note(card, share))
-                        .font(.caption)
-                        .monospacedDigit()
-                        .foregroundStyle(Theme.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .accessibilityElement(children: .combine)
-            }
-        }
-    }
-
-    private func note(_ card: Debt, _ share: Double) -> String {
-        let limit = card.creditLimit ?? 0
-        let base = "\(card.balance.usd) of \(limit.usd)"
-        if share < 0.3 { return "\(base) · already under 30%" }
-        guard let date = store.under30Date(for: card) else { return "\(base) · not under 30% on your current plan" }
-        return "\(base) · under 30% (\((limit * 0.3).usd)) by \(Fmt.full(date))"
     }
 }

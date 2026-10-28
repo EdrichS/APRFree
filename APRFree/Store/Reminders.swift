@@ -1,7 +1,8 @@
 import Foundation
 import UserNotifications
 
-/// Local notifications for due dates and paydays. Rebuilt from scratch whenever data changes.
+/// Local notifications for due dates, paydays and the monthly statement check-in. Rebuilt from
+/// scratch whenever data changes.
 enum Reminders {
     static func requestAuthorization() async -> Bool {
         (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge])) ?? false
@@ -51,8 +52,31 @@ enum Reminders {
             }
         }
 
+        if data.settings.remindCheckIn {
+            for reminder in checkIns(for: data, today: today) {
+                add("checkin-\(reminder.day)", on: reminder.day.date, title: "Statement check-in", body: reminder.body)
+            }
+        }
+
         // iOS keeps at most 64 pending requests per app, so the soonest ones go in first.
         for entry in requests.sorted(by: { $0.fire < $1.fire }).prefix(60) { center.add(entry.request) }
+    }
+
+    /// The monthly statement check-in reminders for this month and the two after it, on the chosen
+    /// day. This month's is left out once every card has been checked in; later months ask about
+    /// every card that still has a balance. A card its bank keeps up to date is never asked about.
+    static func checkIns(for data: AppData, today: Date) -> [(day: Day, body: String)] {
+        let month = Day(today).monthIndex
+        var out: [(day: Day, body: String)] = []
+        for offset in 0..<3 {
+            let waiting = offset == 0 ? data.awaitingCheckIn(today: today) : data.checkInCards
+            guard !waiting.isEmpty else { continue }
+            let body = waiting.count == 1
+                ? "Enter what this month’s \(waiting[0].title) statement says, so its interest is counted."
+                : "Enter what this month’s statements say for \(Fmt.plural(waiting.count, "card")), so their interest is counted."
+            out.append((Day.inMonth(month + offset, day: data.settings.checkInDay), body))
+        }
+        return out
     }
 
     /// Clears reminders already showing in Notification Center, for when everything is erased.

@@ -56,11 +56,14 @@ extension AppData {
 
     /// Undo and redo move the debts, the entries and the plan back and forth. What belongs to the
     /// iPhone rather than to the plan stays as it is now: the reminder switches, the last backup,
-    /// what has been accepted, and notices already read.
+    /// what has been accepted, notices already read, and Connected mode with its bank sign-ins.
     func keepingDeviceSettings(of current: AppData) -> AppData {
         var copy = self
         copy.settings.remindDueDates = current.settings.remindDueDates
         copy.settings.remindPaydays = current.settings.remindPaydays
+        copy.settings.remindCheckIn = current.settings.remindCheckIn
+        copy.settings.checkInDay = current.settings.checkInDay
+        copy.settings.connected = current.settings.connected
         copy.settings.lastBackup = current.settings.lastBackup
         copy.settings.onboarded = current.settings.onboarded
         copy.settings.acceptedPrivacy = current.settings.acceptedPrivacy
